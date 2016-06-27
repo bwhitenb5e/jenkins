@@ -34,8 +34,10 @@ import jenkins.model.Jenkins;
 import org.kohsuke.stapler.export.Exported;
 import org.kohsuke.stapler.export.ExportedBean;
 import com.thoughtworks.xstream.converters.UnmarshallingContext;
+import hudson.Util;
 import java.io.IOException;
 import java.util.HashSet;
+import java.util.Objects;
 import java.util.Set;
 import javax.annotation.CheckForNull;
 import javax.annotation.Nonnull;
@@ -69,21 +71,47 @@ public abstract class Cause {
     public abstract String getShortDescription();
 
     /**
-     * Called when the cause is registered to {@link AbstractBuild}.
-     *
-     * @param build
-     *      never null
-     * @since 1.376
+     * Called when the cause is registered.
+     * @since 1.568
      */
-    public void onAddedTo(AbstractBuild build) {}
+    public void onAddedTo(@Nonnull Run build) {
+        if (build instanceof AbstractBuild) {
+            onAddedTo((AbstractBuild) build);
+        }
+    }
+
+    @Deprecated
+    public void onAddedTo(AbstractBuild build) {
+        if (Util.isOverridden(Cause.class, getClass(), "onAddedTo", Run.class)) {
+            onAddedTo((Run) build);
+        }
+    }
 
     /**
      * Called when a build is loaded from disk.
      * Useful in case the cause needs to keep a build reference;
      * this ought to be {@code transient}.
-     * @since 1.540
+     * @since 1.568
      */
-    public void onLoad(@Nonnull AbstractBuild<?,?> build) {}
+    public void onLoad(@Nonnull Run<?,?> build) {
+        if (build instanceof AbstractBuild) {
+            onLoad((AbstractBuild) build);
+        }
+    }
+
+    void onLoad(@Nonnull Job<?,?> job, int buildNumber) {
+        Run<?,?> build = job.getBuildByNumber(buildNumber);
+        if (build != null) {
+            onLoad(build);
+        }
+    }
+
+    @Deprecated
+    public void onLoad(AbstractBuild<?,?> build) {
+        if (Util.isOverridden(Cause.class, getClass(), "onLoad", Run.class)) {
+            onLoad((Run) build);
+        }
+    }
 
     /**
      * Report a line to the listener about this cause.
@@ -97,6 +125,7 @@ public abstract class Cause {
      * Fall back implementation when no other type is available.
      * @deprecated since 2009-02-08
      */
+    @Deprecated
     public static class LegacyCodeCause extends Cause {
         private StackTraceElement [] stackTrace;
         public LegacyCodeCause() {
@@ -110,7 +139,7 @@ public abstract class Cause {
     }
 
     /**
-     * A build is triggered by the completion of another build (AKA upstream build.)
+     * A build is triggered by another build (AKA upstream build.)
      */
     public static class UpstreamCause extends Cause {
 
@@ -135,6 +164,7 @@ public abstract class Cause {
          * @deprecated since 2009-02-28
          */
         // for backward bytecode compatibility
+        @Deprecated
         public UpstreamCause(AbstractBuild<?,?> up) {
             this((Run<?,?>)up);
         }
@@ -157,6 +187,20 @@ public abstract class Cause {
             this.upstreamCauses = upstreamCauses;
         }
 
+        @Override
+        public void onLoad(@Nonnull Job<?,?> _job, int _buildNumber) {
+            Item i = Jenkins.getInstance().getItemByFullName(this.upstreamProject);
+            if (i == null || !(i instanceof Job)) {
+                // cannot initialize upstream causes
+                return;
+            }
+
+            Job j = (Job)i;
+            for (Cause c : this.upstreamCauses) {
+                c.onLoad(j, upstreamBuild);
+            }
+        }
+
         /**
          * @since 1.515
          */
@@ -169,12 +213,10 @@ public abstract class Cause {
 
             final UpstreamCause o = (UpstreamCause) rhs;
 
-            if (upstreamBuild != o.upstreamBuild) return false;
-            if (!upstreamCauses.equals(o.upstreamCauses)) return false;
-            if (upstreamUrl == null ? o.upstreamUrl != null : !upstreamUrl.equals(o.upstreamUrl)) return false;
-            if (upstreamProject == null ? o.upstreamProject != null : !upstreamProject.equals(o.upstreamProject)) return false;
-
-            return true;
+            return Objects.equals(upstreamBuild, o.upstreamBuild) &&
+                    Objects.equals(upstreamCauses, o.upstreamCauses) &&
+                    Objects.equals(upstreamUrl, o.upstreamUrl) &&
+                    Objects.equals(upstreamProject, o.upstreamProject);
         }
 
         /**
@@ -182,12 +224,7 @@ public abstract class Cause {
          */
         @Override
         public int hashCode() {
-
-            int hashCode = 17;
-            hashCode = hashCode * 31 + upstreamCauses.hashCode();
-            hashCode = hashCode * 31 + upstreamBuild;
-            hashCode = hashCode * 31 + (upstreamUrl == null ? 0 : upstreamUrl.hashCode ());
-            return hashCode * 31 + (upstreamProject == null ? 0 : upstreamProject.hashCode ());
+            return Objects.hash(upstreamCauses, upstreamBuild, upstreamUrl, upstreamProject);
         }
 
         private @Nonnull Cause trim(@Nonnull Cause c, int depth, Set<String> traversed) {
@@ -309,6 +346,7 @@ public abstract class Cause {
             @Override public String toString() {
                 return "JENKINS-14814";
             }
+            @Override public void onLoad(@Nonnull Job<?,?> _job, int _buildNumber) {}
         }
 
     }
@@ -319,6 +357,7 @@ public abstract class Cause {
      * @deprecated 1.428
      *   use {@link UserIdCause}
      */
+    @Deprecated
     public static class UserCause extends Cause {
         private String authenticationName;
         public UserCause() {
@@ -385,13 +424,12 @@ public abstract class Cause {
 
         @Override
         public boolean equals(Object o) {
-            return o instanceof UserIdCause && Arrays.equals(new Object[]{userId},
-                    new Object[]{((UserIdCause) o).userId});
+            return o instanceof UserIdCause && Objects.equals(userId, ((UserIdCause) o).userId);
         }
 
         @Override
         public int hashCode() {
-            return 295 + (this.userId != null ? this.userId.hashCode() : 0);
+            return Objects.hash(userId);
         }
     }
 
@@ -415,19 +453,25 @@ public abstract class Cause {
             }
             return Messages.Cause_RemoteCause_ShortDescription(addr);
         }
+        
+        @Exported(visibility = 3)
+        public String getAddr() {
+            return addr;
+        }
+        
+        @Exported(visibility = 3)
+        public String getNote() {
+            return note;
+        }
 
         @Override
         public boolean equals(Object o) {
-            return o instanceof RemoteCause && Arrays.equals(new Object[] {addr, note},
-                    new Object[] {((RemoteCause)o).addr, ((RemoteCause)o).note});
+            return o instanceof RemoteCause && Objects.equals(addr, ((RemoteCause) o).addr) && Objects.equals(note, ((RemoteCause) o).note);
         }
 
         @Override
         public int hashCode() {
-            int hash = 5;
-            hash = 83 * hash + (this.addr != null ? this.addr.hashCode() : 0);
-            hash = 83 * hash + (this.note != null ? this.note.hashCode() : 0);
-            return hash;
+            return Objects.hash(addr, note);
         }
     }
 }

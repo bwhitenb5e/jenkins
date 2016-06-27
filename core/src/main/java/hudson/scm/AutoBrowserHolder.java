@@ -37,7 +37,9 @@ import jenkins.model.Jenkins;
  *
  * <p>
  * This class makes such tracking easy by hiding this logic.
+ * @deprecated Disabled by default: JENKINS-35098
  */
+@Deprecated
 final class AutoBrowserHolder {
     private int cacheGeneration;
     private RepositoryBrowser cache;
@@ -48,7 +50,17 @@ final class AutoBrowserHolder {
     }
 
     public RepositoryBrowser get() {
-        int g = owner.getDescriptor().generation;
+        if (cacheGeneration == -1) {
+            return cache;
+        }
+        SCMDescriptor<?> d = owner.getDescriptor();
+        RepositoryBrowser<?> dflt = owner.guessBrowser();
+        if (dflt != null) {
+            cache = dflt;
+            cacheGeneration = -1;
+            return cache;
+        }
+        int g = d.generation;
         if(g!=cacheGeneration) {
             cacheGeneration = g;
             cache = infer();

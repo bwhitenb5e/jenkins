@@ -11,10 +11,10 @@ def f=namespace(lib.FormTagLib)
 def l=namespace(lib.LayoutTagLib)
 def st=namespace("jelly:stapler")
 
-l.layout(norefresh:true, permission:app.ADMINISTER, title:my.displayName) {
+l.layout(norefresh:true, permission:app.ADMINISTER, title:my.displayName, cssclass:request.getParameter('decorate')) {
     l.main_panel {
         h1 {
-            img(src:"${imagesURL}/48x48/secure.png", height:48,width:48)
+            l.icon(class: 'icon-secure icon-xlg')
             text(my.displayName)
         }
 
@@ -25,7 +25,7 @@ l.layout(norefresh:true, permission:app.ADMINISTER, title:my.displayName) {
             set("descriptor", my.descriptor);
 
             f.optionalBlock( field:"useSecurity", title:_("Enable security"), checked:app.useSecurity) {
-                f.entry (title:_("TCP port for JNLP slave agents"), field:"slaveAgentPort") {
+                f.entry (title:_("TCP port for JNLP agents"), field:"slaveAgentPort") {
                     f.serverTcpPort()
                 }
 

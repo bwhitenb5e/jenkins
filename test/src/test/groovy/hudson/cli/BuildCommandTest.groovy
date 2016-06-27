@@ -24,26 +24,44 @@
 package hudson.cli
 
 import org.apache.commons.io.output.TeeOutputStream
+
+import static org.hamcrest.Matchers.*;
+import static hudson.cli.CLICommandInvoker.Matcher.*;
 import static org.junit.Assert.*
+import hudson.Extension
+
 import org.junit.Rule
 import org.junit.Test
+import org.jvnet.hudson.test.Issue
+import org.jvnet.hudson.test.CaptureEnvironmentBuilder
 import org.jvnet.hudson.test.JenkinsRule
-import org.jvnet.hudson.test.RandomlyFails
 import org.jvnet.hudson.test.TestBuilder
 import org.jvnet.hudson.test.TestExtension
+import org.kohsuke.stapler.StaplerRequest
 
 import hudson.Launcher
+import hudson.cli.CLICommandInvoker;
 import hudson.model.AbstractBuild
 import hudson.model.Action
 import hudson.model.BuildListener
+import hudson.model.Executor
 import hudson.model.FreeStyleProject;
+import hudson.model.ParameterDefinition.ParameterDescriptor
+import hudson.model.ParameterValue
 import hudson.model.ParametersAction
 import hudson.model.ParametersDefinitionProperty
 import hudson.model.Queue.QueueDecisionHandler
 import hudson.model.Queue.Task;
+import hudson.model.SimpleParameterDefinition
 import hudson.model.StringParameterDefinition
+import hudson.model.StringParameterValue
+import hudson.model.labels.LabelAtom
 import hudson.tasks.Shell
 import hudson.util.OneShotEvent
+
+import java.util.concurrent.Executor
+
+import net.sf.json.JSONObject
 
 /**
  * {@link BuildCommand} test.
@@ -140,7 +158,7 @@ public class BuildCommandTest {
         }
     }
 
-    @RandomlyFails("Started test0 #1")
+    // TODO randomly fails: Started test0 #1
     @Test void consoleOutput() {
         def p = j.createFreeStyleProject()
         def cli = new CLI(j.URL)
@@ -148,14 +166,14 @@ public class BuildCommandTest {
             def o = new ByteArrayOutputStream()
             cli.execute(["build","-s","-v",p.name],System.in,new TeeOutputStream(System.out,o),System.err)
             j.assertBuildStatusSuccess(p.getBuildByNumber(1))
-            assertTrue(o.toString(), o.toString().contains("Started by command line by anonymous"))
+            assertTrue(o.toString(), o.toString().contains("Started from command line by anonymous"))
             assertTrue(o.toString().contains("Finished: SUCCESS"))
         } finally {
             cli.close()
         }
     }
 
-    @RandomlyFails("Started test0 #1")
+    // TODO randomly fails: Started test0 #1
     @Test void consoleOutputWhenBuildSchedulingRefused() {
         def p = j.createFreeStyleProject()
         def cli = new CLI(j.URL)
@@ -182,8 +200,8 @@ public class BuildCommandTest {
         def invoker = new CLICommandInvoker(j, new BuildCommand());
         def result = invoker.invokeWithArgs("the-project");
 
-        assertTrue("Error message missing", result.stderr().contains("Cannot build the-project because it is disabled."));
-        assertEquals("Command is expected to fail", -1, result.returnCode());
+        assertThat(result, failedWith(4));
+        assertThat(result.stderr(), containsString("ERROR: Cannot build the-project because it is disabled."));
         assertNull("Project should not be built", project.getBuildByNumber(1));
     }
 
@@ -194,8 +212,8 @@ public class BuildCommandTest {
         def invoker = new CLICommandInvoker(j, new BuildCommand());
         def result = invoker.invokeWithArgs("new-one");
 
-        assertTrue("Error message missing", result.stderr().contains("Cannot build new-one because its configuration has not been saved."));
-        assertEquals("Command is expected to fail", -1, result.returnCode());
+        assertThat(result, failedWith(4));
+        assertThat(result.stderr(), containsString("ERROR: Cannot build new-one because its configuration has not been saved."));
         assertNull("Project should not be built", newOne.getBuildByNumber(1));
     }
 
@@ -209,7 +227,70 @@ public class BuildCommandTest {
         def invoker = new CLICommandInvoker(j, new BuildCommand());
         def result = invoker.invokeWithArgs("the-project", "-p", "expr=a=b", "-s");
 
-        assertEquals("Command is expected to succeed", 0, result.returnCode());
+        assertThat(result, succeeded());
         assertEquals("a=b", project.getBuildByNumber(1).getBuildVariables().get("expr"));
+    }
+    
+    @Issue("JENKINS-15094")
+    @Test public void executorsAliveOnParameterWithNullDefaultValue() throws Exception {    
+        def slave = j.createSlave();
+        FreeStyleProject project = j.createFreeStyleProject("foo");
+        project.setAssignedNode(slave);
+        
+        // Create test parameter with Null default value 
+        def nullDefaultDefinition = new NullDefaultValueParameterDefinition();
+        ParametersDefinitionProperty pdp = new ParametersDefinitionProperty(
+                new StringParameterDefinition("string", "defaultValue", "description"),
+                nullDefaultDefinition);
+        project.addProperty(pdp);
+        CaptureEnvironmentBuilder builder = new CaptureEnvironmentBuilder();
+        project.getBuildersList().add(builder);
+     
+        // Warmup
+        j.buildAndAssertSuccess(project);
+        
+        for (def exec : slave.toComputer().getExecutors()) {
+            assertTrue("Executor has died before the test start: "+exec, exec.isActive());
+        }
+        
+        // Create CLI & run command
+        def invoker = new CLICommandInvoker(j, new BuildCommand());
+        def result = invoker.invokeWithArgs("foo","-p","string=value");
+        assertThat(result, failedWith(2));
+        assertThat(result.stderr(), containsString("ERROR: No default value for the parameter \'FOO\'."));
+        
+        Thread.sleep(5000); // Give the job 5 seconds to be submitted
+        assertNull("Build should not be scheduled", j.jenkins.getQueue().getItem(project));
+        assertNull("Build should not be scheduled", project.getBuildByNumber(2));
+        
+        // Check executors health after a timeout
+        for (def exec : slave.toComputer().getExecutors()) {
+            assertTrue("Executor is dead: "+exec, exec.isActive());
+        }
+    }
+    
+    public static final class NullDefaultValueParameterDefinition extends SimpleParameterDefinition {
+        
+        /*package*/ NullDefaultValueParameterDefinition() {
+            super("FOO", "Always null default value");
+        }
+        
+        @Override
+        public ParameterValue createValue(String value) {
+            return new StringParameterValue("FOO", "BAR");
+        }
+        
+        @Override
+        public ParameterValue createValue(StaplerRequest req, JSONObject jo) {
+            return createValue("BAR");
+        }
+        
+        @Override
+        public ParameterValue getDefaultParameterValue() {
+            return null; // Equals to super.getDefaultParameterValue();
+        }
+        
+        @Extension
+        public static class DescriptorImpl extends ParameterDescriptor {}
     }
 }

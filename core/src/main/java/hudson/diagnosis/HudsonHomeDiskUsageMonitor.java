@@ -24,11 +24,11 @@
 package hudson.diagnosis;
 
 import hudson.model.AdministrativeMonitor;
-import jenkins.model.Jenkins;
 import hudson.model.AbstractModelObject;
 import hudson.Extension;
 import hudson.ExtensionPoint;
 import hudson.ExtensionList;
+import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.HttpResponses;
 import org.kohsuke.stapler.QueryParameter;
@@ -41,7 +41,7 @@ import java.util.List;
  *
  * @author Kohsuke Kawaguchi
  */
-@Extension
+@Extension @Symbol("diskUsageCheck")
 public final class HudsonHomeDiskUsageMonitor extends AdministrativeMonitor {
     /**
      * Value updated by {@link HudsonHomeDiskUsageChecker}.
@@ -134,7 +134,7 @@ public final class HudsonHomeDiskUsageMonitor extends AdministrativeMonitor {
          * All registered {@link Solution}s.
          */
         public static ExtensionList<Solution> all() {
-            return Jenkins.getInstance().getExtensionList(Solution.class);
+            return ExtensionList.lookup(Solution.class);
         }
     }
 }

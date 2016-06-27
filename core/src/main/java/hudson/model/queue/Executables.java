@@ -27,6 +27,8 @@ import hudson.model.Queue.Executable;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
 
 /**
  * Convenience methods around {@link Executable}.
@@ -37,9 +39,9 @@ public class Executables {
     /**
      * Due to the return type change in {@link Executable}, the caller needs a special precaution now.
      */
-    public static SubTask getParentOf(Executable e) {
+    public static @Nonnull SubTask getParentOf(Executable e) {
         try {
-            return _getParentOf(e);
+            return e.getParent();
         } catch (AbstractMethodError _) {
             try {
                 Method m = e.getClass().getMethod("getParent");
@@ -59,31 +61,21 @@ public class Executables {
     }
 
     /**
-     * A pointless function to work around what appears to be a HotSpot problem. See JENKINS-5756 and bug 6933067
-     * on BugParade for more details.
-     */
-    private static SubTask _getParentOf(Executable e) {
-        return e.getParent();
-    }
-
-    /**
      * Returns the estimated duration for the executable.
+     * If the Executable is null the Estimated Duration can't be evaluated, then -1 is returned.
+     * This can happen if Computer.getIdleStartMilliseconds() is called before the executable is set to non-null in Computer.run()
+     * or if the executor thread exits prematurely, see JENKINS-30456
      * Protects against {@link AbstractMethodError}s if the {@link Executable} implementation
      * was compiled against Hudson < 1.383
+     *
+     * @return the estimated duration for a given executable, -1 if the executable is null
      */
-    public static long getEstimatedDurationFor(Executable e) {
+    public static long getEstimatedDurationFor(@CheckForNull Executable e) {
         try {
-            return _getEstimatedDuration(e);
+            return (e != null) ? e.getEstimatedDuration() : -1;
         } catch (AbstractMethodError error) {
-            return e.getParent().getEstimatedDuration();
+            return (e != null) ? e.getParent().getEstimatedDuration() : -1;
         }
     }
 
-    /**
-     * A pointless function to work around what appears to be a HotSpot problem. See JENKINS-5756 and bug 6933067
-     * on BugParade for more details.
-     */
-    private static long _getEstimatedDuration(Executable e) {
-        return e.getEstimatedDuration();
-    }
 }

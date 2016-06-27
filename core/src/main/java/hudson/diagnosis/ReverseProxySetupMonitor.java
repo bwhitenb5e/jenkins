@@ -24,13 +24,19 @@
 package hudson.diagnosis;
 
 import hudson.Extension;
+import hudson.Util;
 import hudson.model.AdministrativeMonitor;
+import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.HttpRedirect;
 import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.HttpResponses;
 import org.kohsuke.stapler.QueryParameter;
 
 import java.io.IOException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import jenkins.model.Jenkins;
+import org.kohsuke.stapler.Stapler;
 
 /**
  * Looks out for a broken reverse proxy setup that doesn't rewrite the location header correctly.
@@ -43,8 +49,11 @@ import java.io.IOException;
  *
  * @author Kohsuke Kawaguchi
  */
-@Extension
+@Extension @Symbol("reverseProxy")
 public class ReverseProxySetupMonitor extends AdministrativeMonitor {
+
+    private static final Logger LOGGER = Logger.getLogger(ReverseProxySetupMonitor.class.getName());
+
     @Override
     public boolean isActivated() {
         // return true to always inject an HTML fragment to perform a test
@@ -52,14 +61,23 @@ public class ReverseProxySetupMonitor extends AdministrativeMonitor {
     }
 
     public HttpResponse doTest() {
-        return new HttpRedirect("testForReverseProxySetup/a%2Fb/");
+        String referer = Stapler.getCurrentRequest().getReferer();
+        Jenkins j = Jenkins.getInstance();
+        // May need to send an absolute URL, since handling of HttpRedirect with a relative URL does not currently honor X-Forwarded-Proto/Port at all.
+        String redirect = j.getRootUrl() + "administrativeMonitor/" + id + "/testForReverseProxySetup/" + (referer != null ? Util.rawEncode(referer) : "NO-REFERER") + "/";
+        LOGGER.log(Level.FINE, "coming from {0} and redirecting to {1}", new Object[] {referer, redirect});
+        return new HttpRedirect(redirect);
     }
 
     public void getTestForReverseProxySetup(String rest) {
-        if (rest.equals("a/b")) {
+        Jenkins j = Jenkins.getInstance();
+        String inferred = j.getRootUrlFromRequest() + "manage";
+        // TODO this could also verify that j.getRootUrl() has been properly configured, and send a different message if not
+        if (rest.startsWith(inferred)) { // not using equals due to JENKINS-24014
             throw HttpResponses.ok();
         } else {
-            throw HttpResponses.errorWithoutStack(404, "expected a/b but got " + rest);
+            LOGGER.log(Level.WARNING, "{0} vs. {1}", new Object[] {inferred, rest});
+            throw HttpResponses.errorWithoutStack(404, inferred + " vs. " + rest);
         }
     }
 

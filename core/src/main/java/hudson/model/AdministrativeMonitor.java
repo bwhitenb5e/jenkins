@@ -28,7 +28,6 @@ import hudson.ExtensionList;
 import hudson.Extension;
 import hudson.ExtensionPoint.LegacyInstancesAreScopedToHudson;
 import hudson.triggers.SCMTrigger;
-import hudson.triggers.TimerTrigger;
 
 import java.util.Set;
 import java.io.IOException;
@@ -153,6 +152,6 @@ public abstract class AdministrativeMonitor extends AbstractModelObject implemen
      * All registered {@link AdministrativeMonitor} instances.
      */
     public static ExtensionList<AdministrativeMonitor> all() {
-        return Jenkins.getInstance().getExtensionList(AdministrativeMonitor.class);
+        return ExtensionList.lookup(AdministrativeMonitor.class);
     }
 }

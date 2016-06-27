@@ -68,6 +68,7 @@ import org.acegisecurity.Authentication;
 import org.acegisecurity.context.SecurityContext;
 import org.acegisecurity.context.SecurityContextHolder;
 import org.apache.commons.lang.StringUtils;
+import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
@@ -144,6 +145,7 @@ public class BuildTrigger extends Recorder implements DependencyDeclarer {
      * @deprecated as of 1.406
      *      Use {@link #getChildProjects(ItemGroup)}
      */
+    @Deprecated
     public List<AbstractProject> getChildProjects() {
         return getChildProjects(Jenkins.getInstance());
     }
@@ -172,6 +174,7 @@ public class BuildTrigger extends Recorder implements DependencyDeclarer {
      * @deprecated as of 1.406
      *      Use {@link #hasSame(AbstractProject, Collection)}
      */
+    @Deprecated
     public boolean hasSame(Collection<? extends AbstractProject> projects) {
         return hasSame(null,projects);
     }
@@ -247,11 +250,9 @@ public class BuildTrigger extends Recorder implements DependencyDeclarer {
                         logger.println(Messages.BuildTrigger_Disabled(ModelHyperlinkNote.encodeTo(p)));
                         continue;
                     }
-                    // this is not completely accurate, as a new build might be triggered
-                    // between these calls
                     boolean scheduled = p.scheduleBuild(p.getQuietPeriod(), new UpstreamCause((Run)build), buildActions.toArray(new Action[buildActions.size()]));
                     if (Jenkins.getInstance().getItemByFullName(p.getFullName()) == p) {
-                        String name = ModelHyperlinkNote.encodeTo(p) + " #" + p.getNextBuildNumber();
+                        String name = ModelHyperlinkNote.encodeTo(p);
                         if (scheduled) {
                             logger.println(Messages.BuildTrigger_Triggering(name));
                         } else {
@@ -331,7 +332,7 @@ public class BuildTrigger extends Recorder implements DependencyDeclarer {
         return this;
     }
 
-    @Extension
+    @Extension @Symbol("downstream")
     public static class DescriptorImpl extends BuildStepDescriptor<Publisher> {
         public String getDisplayName() {
             return Messages.BuildTrigger_DisplayName();
@@ -367,6 +368,8 @@ public class BuildTrigger extends Recorder implements DependencyDeclarer {
          * Form validation method.
          */
         public FormValidation doCheck(@AncestorInPath AbstractProject project, @QueryParameter String value) {
+            // JENKINS-32525: Check that it behaves gracefully for an unknown context
+            if (project == null) return FormValidation.ok(Messages.BuildTrigger_ok_ancestor_is_null());
             // Require CONFIGURE permission on this project
             if(!project.hasPermission(Item.CONFIGURE))      return FormValidation.ok();
 
@@ -408,7 +411,14 @@ public class BuildTrigger extends Recorder implements DependencyDeclarer {
         @Extension
         public static class ItemListenerImpl extends ItemListener {
             @Override
-            public void onLocationChanged(Item item, String oldFullName, String newFullName) {
+            public void onLocationChanged(final Item item, final String oldFullName, final String newFullName) {
+                ACL.impersonate(ACL.SYSTEM, new Runnable() {
+                    @Override public void run() {
+                        locationChanged(item, oldFullName, newFullName);
+                    }
+                });
+            }
+            private void locationChanged(Item item, String oldFullName, String newFullName) {
                 // update BuildTrigger of other projects that point to this object.
                 // can't we generalize this?
                 for( Project<?,?> p : Jenkins.getInstance().getAllItems(Project.class) ) {

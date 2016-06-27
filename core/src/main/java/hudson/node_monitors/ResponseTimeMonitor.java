@@ -25,9 +25,9 @@ package hudson.node_monitors;
 
 import hudson.Util;
 import hudson.Extension;
-import hudson.slaves.OfflineCause;
 import hudson.model.Computer;
 import hudson.remoting.Callable;
+import jenkins.security.MasterToSlaveCallable;
 import net.sf.json.JSONObject;
 import org.kohsuke.stapler.StaplerRequest;
 
@@ -40,7 +40,7 @@ import org.kohsuke.stapler.export.Exported;
 import org.kohsuke.stapler.export.ExportedBean;
 
 /**
- * Monitors the round-trip response time to this slave.
+ * Monitors the round-trip response time to this agent.
  *
  * @author Kohsuke Kawaguchi
  */
@@ -64,9 +64,9 @@ public class ResponseTimeMonitor extends NodeMonitor {
                 }
 
                 if(d.hasTooManyTimeouts() && !isIgnored()) {
-                    // unlike other monitors whose failure still allow us to communicate with the slave,
+                    // unlike other monitors whose failure still allow us to communicate with the agent,
                     // the failure in this monitor indicates that we are just unable to make any requests
-                    // to this slave. So we should severe the connection, as opposed to marking it temporarily
+                    // to this agent. So we should severe the connection, as opposed to marking it temporarily
                     // off line, which still keeps the underlying channel open.
                     c.disconnect(d);
                     LOGGER.warning(Messages.ResponseTimeMonitor_MarkedOffline(c.getName()));
@@ -85,7 +85,7 @@ public class ResponseTimeMonitor extends NodeMonitor {
         }
     };
 
-    private static final class Step1 implements Callable<Data,IOException> {
+    private static final class Step1 extends MasterToSlaveCallable<Data,IOException> {
         private Data cur;
 
         private Step1(Data cur) {
@@ -104,7 +104,7 @@ public class ResponseTimeMonitor extends NodeMonitor {
         private static final long serialVersionUID = 1L;
     }
 
-    private static final class Step2 implements Callable<Step3,IOException> {
+    private static final class Step2 extends MasterToSlaveCallable<Step3,IOException> {
         private final Data cur;
         private final long start = System.currentTimeMillis();
 
@@ -141,7 +141,7 @@ public class ResponseTimeMonitor extends NodeMonitor {
      * Immutable representation of the monitoring data.
      */
     @ExportedBean
-    public static final class Data extends OfflineCause implements Serializable {
+    public static final class Data extends MonitorOfflineCause implements Serializable {
         /**
          * Record of the past 5 times. -1 if time out. Otherwise in milliseconds.
          * Old ones first.
@@ -187,7 +187,7 @@ public class ResponseTimeMonitor extends NodeMonitor {
         }
 
         /**
-         * HTML rendering of the data
+         * String rendering of the data
          */
         @Override
         public String toString() {
@@ -199,8 +199,13 @@ public class ResponseTimeMonitor extends NodeMonitor {
 //            return buf.toString();
             int fc = failureCount();
             if(fc>0)
-                return Util.wrapToErrorSpan(Messages.ResponseTimeMonitor_TimeOut(fc));
+                return Messages.ResponseTimeMonitor_TimeOut(fc);
             return getAverage()+"ms";
+        }
+
+        @Override
+        public Class<? extends NodeMonitor> getTrigger() {
+            return ResponseTimeMonitor.class;
         }
 
         private static final long serialVersionUID = 1L;

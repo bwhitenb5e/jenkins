@@ -32,17 +32,24 @@ import hudson.util.NullStream;
 import hudson.util.StreamTaskListener;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.IOException;
+import java.util.Arrays;
 import static org.junit.Assert.*;
+import org.junit.Assume;
 import static org.junit.Assume.*;
+import org.junit.Rule;
 import org.junit.Test;
-import org.jvnet.hudson.test.Bug;
+import org.junit.rules.TemporaryFolder;
+import org.jvnet.hudson.test.Issue;
 
 public class TarArchiverTest {
+
+    @Rule public TemporaryFolder tmp = new TemporaryFolder();
 
     /**
      * Makes sure that permissions are properly stored in the tar file.
      */
-    @Bug(9397)
+    @Issue("JENKINS-9397")
     @Test public void permission() throws Exception {
         assumeTrue(!Functions.isWindows());
 
@@ -72,7 +79,7 @@ public class TarArchiverTest {
             e.mkdirs();
 
             // extract via the tar command
-            assertEquals(0, new LocalLauncher(new StreamTaskListener(System.out)).launch().cmds("tar", "xvpf", tar.getAbsolutePath()).pwd(e).join());
+            run(e, "tar", "xvpf", tar.getAbsolutePath());
 
             assertEquals(0100755,e.child("a.txt").mode());
             assertEquals(dirMode,e.child("subdir").mode());
@@ -81,7 +88,7 @@ public class TarArchiverTest {
 
             // extract via the zip command
             e.deleteContents();
-            assertEquals(0, new LocalLauncher(new StreamTaskListener(System.out)).launch().cmds("unzip", zip.getAbsolutePath()).pwd(e).join());
+            run(e, "unzip", zip.getAbsolutePath());
             e = e.listDirectories().get(0);
 
             assertEquals(0100755, e.child("a.txt").mode());
@@ -94,10 +101,18 @@ public class TarArchiverTest {
         }
     }
 
-    @Bug(14922)
+    private static void run(FilePath dir, String... cmds) throws InterruptedException {
+        try {
+            assertEquals(0, new LocalLauncher(StreamTaskListener.fromStdout()).launch().cmds(cmds).pwd(dir).join());
+        } catch (IOException x) { // perhaps restrict to x.message.contains("Cannot run program")? or "error=2, No such file or directory"?
+            Assume.assumeNoException("failed to run " + Arrays.toString(cmds), x);
+        }
+    }
+
+    @Issue("JENKINS-14922")
     @Test public void brokenSymlinks() throws Exception {
         assumeTrue(!Functions.isWindows());
-        File dir = Util.createTempDir();
+        File dir = tmp.getRoot();
         Util.createSymlink(dir, "nonexistent", "link", TaskListener.NULL);
         new FilePath(dir).tar(new NullStream(), "**");
     }

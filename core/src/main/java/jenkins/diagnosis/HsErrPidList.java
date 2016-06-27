@@ -24,13 +24,15 @@ import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import org.apache.commons.io.IOUtils;
+import org.jenkinsci.Symbol;
 
 /**
  * Finds crash dump reports and show them in the UI.
  *
  * @author Kohsuke Kawaguchi
  */
-@Extension(optional=true)
+@Extension(optional=true) @Symbol("hsErrPid")
+// TODO why would an extension using a built-in extension point need to be marked optional?
 public class HsErrPidList extends AdministrativeMonitor {
     /**
      * hs_err_pid files that we think belong to us.
@@ -43,10 +45,20 @@ public class HsErrPidList extends AdministrativeMonitor {
     private MappedByteBuffer map;
 
     public HsErrPidList() {
+        if (Functions.getIsUnitTest()) {
+            return;
+        }
         try {
-            FileChannel ch = new FileInputStream(getSecretKeyFile()).getChannel();
-            map = ch.map(MapMode.READ_ONLY,0,1);
-
+            FileChannel ch = null;
+            try {
+                ch = new FileInputStream(getSecretKeyFile()).getChannel();
+                map = ch.map(MapMode.READ_ONLY,0,1);
+            } finally {
+                if (ch != null) {
+                    ch.close();
+                }
+            }
+                
             scan("./hs_err_pid%p.log");
             if (Functions.isWindows()) {
                 File dir = Kernel32Utils.getTempDir();

@@ -1,11 +1,26 @@
 package hudson.slaves;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotSame;
+import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertTrue;
+
+import com.gargoylesoftware.htmlunit.html.DomNodeUtil;
 import com.gargoylesoftware.htmlunit.html.HtmlForm;
 import com.gargoylesoftware.htmlunit.html.HtmlLabel;
+import hudson.model.Descriptor;
 import hudson.model.Descriptor.FormException;
 import hudson.model.Slave;
+import java.util.logging.ConsoleHandler;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import net.sf.json.JSONObject;
-import org.jvnet.hudson.test.HudsonTestCase;
+import org.junit.BeforeClass;
+import org.junit.Rule;
+import org.junit.Test;
+import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestExtension;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.StaplerRequest;
@@ -13,15 +28,28 @@ import org.kohsuke.stapler.StaplerRequest;
 /**
  * @author Kohsuke Kawaguchi
  */
-public class NodePropertyTest extends HudsonTestCase {
-    public void testInvisibleProperty() throws Exception {
-        DumbSlave s = createSlave();
+public class NodePropertyTest {
+
+    private static final Logger logger = Logger.getLogger(Descriptor.class.getName());
+    @BeforeClass
+    public static void logging() {
+        logger.setLevel(Level.ALL);
+        Handler handler = new ConsoleHandler();
+        handler.setLevel(Level.ALL);
+        logger.addHandler(handler);
+    }
+
+    @Rule
+    public JenkinsRule j = new JenkinsRule();
+
+    @Test
+    public void invisibleProperty() throws Exception {
+        DumbSlave s = j.createSlave();
         InvisibleProperty before = new InvisibleProperty();
         s.getNodeProperties().add(before);
         assertFalse(before.reconfigured);
 
-
-        DumbSlave s2 = configRoundtrip(s);
+        DumbSlave s2 = j.configRoundtrip(s);
         assertNotSame(s,s2);
         InvisibleProperty after = s2.getNodeProperties().get(InvisibleProperty.class);
 
@@ -31,35 +59,32 @@ public class NodePropertyTest extends HudsonTestCase {
 
     public static class InvisibleProperty extends NodeProperty<Slave> {
         boolean reconfigured = false;
+
         @Override
         public NodeProperty<?> reconfigure(StaplerRequest req, JSONObject form) throws FormException {
             reconfigured = true;
             return this;
         }
 
-        @TestExtension
-        public static class DescriptorImpl extends NodePropertyDescriptor {
-            @Override
-            public String getDisplayName() {
-                return null;
-            }
-        }
+        @TestExtension("invisibleProperty")
+        public static class DescriptorImpl extends NodePropertyDescriptor {}
     }
 
-    public void testBasicConfigRoundtrip() throws Exception {
-        DumbSlave s = createSlave();
-        HtmlForm f = createWebClient().goTo("/computer/" + s.getNodeName() + "/configure").getFormByName("config");
-        ((HtmlLabel)f.selectSingleNode(".//LABEL[text()='Some Property']")).click();
-        submit(f);
-        PropertyImpl p = jenkins.getNode(s.getNodeName()).getNodeProperties().get(PropertyImpl.class);
+    @Test
+    public void basicConfigRoundtrip() throws Exception {
+        DumbSlave s = j.createSlave();
+        HtmlForm f = j.createWebClient().goTo("computer/" + s.getNodeName() + "/configure").getFormByName("config");
+        ((HtmlLabel)DomNodeUtil.selectSingleNode(f, ".//LABEL[text()='PropertyImpl']")).click();
+        j.submit(f);
+        PropertyImpl p = j.jenkins.getNode(s.getNodeName()).getNodeProperties().get(PropertyImpl.class);
         assertEquals("Duke",p.name);
 
         p.name = "Kohsuke";
-        configRoundtrip(s);
+        j.configRoundtrip(s);
 
-        PropertyImpl p2 = jenkins.getNode(s.getNodeName()).getNodeProperties().get(PropertyImpl.class);
+        PropertyImpl p2 = j.jenkins.getNode(s.getNodeName()).getNodeProperties().get(PropertyImpl.class);
         assertNotSame(p,p2);
-        assertEqualDataBoundBeans(p,p2);
+        j.assertEqualDataBoundBeans(p, p2);
     }
 
     public static class PropertyImpl extends NodeProperty<Slave> {
@@ -70,12 +95,7 @@ public class NodePropertyTest extends HudsonTestCase {
             this.name = name;
         }
 
-        @TestExtension("testBasicConfigRoundtrip")
-        public static class DescriptorImpl extends NodePropertyDescriptor {
-            @Override
-            public String getDisplayName() {
-                return "Some Property";
-            }
-        }
+        @TestExtension("basicConfigRoundtrip")
+        public static class DescriptorImpl extends NodePropertyDescriptor {}
     }
 }

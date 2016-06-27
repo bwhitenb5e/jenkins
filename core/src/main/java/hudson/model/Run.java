@@ -32,20 +32,21 @@ import com.thoughtworks.xstream.XStream;
 import hudson.AbortException;
 import hudson.BulkChange;
 import hudson.EnvVars;
+import hudson.ExtensionList;
 import hudson.ExtensionPoint;
 import hudson.FeedAdapter;
 import hudson.Functions;
+import jenkins.util.SystemProperties;
 import hudson.Util;
 import hudson.XmlFile;
 import hudson.cli.declarative.CLIMethod;
-import hudson.console.AnnotatedLargeText;
-import hudson.console.ConsoleLogFilter;
-import hudson.console.ConsoleNote;
-import hudson.console.ModelHyperlinkNote;
+import hudson.console.*;
 import hudson.model.Descriptor.FormException;
 import hudson.model.Run.RunExecution;
 import hudson.model.listeners.RunListener;
 import hudson.model.listeners.SaveableListener;
+import hudson.model.queue.Executables;
+import hudson.model.queue.SubTask;
 import hudson.search.SearchIndexBuilder;
 import hudson.security.ACL;
 import hudson.security.AccessControlled;
@@ -53,8 +54,6 @@ import hudson.security.Permission;
 import hudson.security.PermissionGroup;
 import hudson.security.PermissionScope;
 import hudson.tasks.BuildWrapper;
-import hudson.tasks.test.AbstractTestResultAction;
-import hudson.util.FlushProofOutputStream;
 import hudson.util.FormApply;
 import hudson.util.LogTaskListener;
 import hudson.util.ProcessTree;
@@ -71,10 +70,8 @@ import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.io.Reader;
 import java.io.StringWriter;
-import java.io.Writer;
 import java.nio.charset.Charset;
 import java.text.DateFormat;
-import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -108,9 +105,11 @@ import jenkins.model.PeepholePermalink;
 import jenkins.model.RunAction2;
 import jenkins.model.StandardArtifactManager;
 import jenkins.model.lazy.BuildReference;
+import jenkins.model.lazy.LazyBuildMixIn;
 import jenkins.util.VirtualFile;
 import jenkins.util.io.OnMaster;
 import net.sf.json.JSONObject;
+import org.acegisecurity.AccessDeniedException;
 import org.acegisecurity.Authentication;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.jelly.XMLOutput;
@@ -136,7 +135,13 @@ import org.kohsuke.stapler.interceptor.RequirePOST;
 public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,RunT>>
         extends Actionable implements ExtensionPoint, Comparable<RunT>, AccessControlled, PersistenceRoot, DescriptorByNameOwner, OnMaster {
 
-    protected transient final JobT project;
+    /**
+     * The original {@link Queue.Item#getId()} has not yet been mapped onto the {@link Run} instance.
+     * @since 1.601
+     */
+    public static final long QUEUE_ID_UNKNOWN = -1;
+
+    protected transient final @Nonnull JobT project;
 
     /**
      * Build number.
@@ -145,7 +150,12 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * In earlier versions &lt; 1.24, this number is not unique nor continuous,
      * but going forward, it will, and this really replaces the build id.
      */
-    public /*final*/ int number;
+    public transient /*final*/ int number;
+
+    /**
+     * The original Queue task ID from where this Run instance originated.
+     */
+    private long queueId = Run.QUEUE_ID_UNKNOWN;
 
     /**
      * Previous build. Can be null.
@@ -171,10 +181,13 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      */
     /* does not compile on JDK 7: private*/ volatile transient RunT previousBuildInProgress;
 
+    /** ID as used for historical build records; otherwise null. */
+    private @CheckForNull String id;
+    
     /**
      * When the build is scheduled.
      */
-    protected transient final long timestamp;
+    protected /*final*/ long timestamp;
 
     /**
      * When the build has started running.
@@ -265,22 +278,12 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      */
     private @CheckForNull ArtifactManager artifactManager;
 
-    private static final SimpleDateFormat CANONICAL_ID_FORMATTER = new SimpleDateFormat("yyyy-MM-dd_HH-mm-ss");
-    public static final ThreadLocal<SimpleDateFormat> ID_FORMATTER = new IDFormatterProvider();
-    private static final class IDFormatterProvider extends ThreadLocal<SimpleDateFormat> {
-                @Override
-                protected SimpleDateFormat initialValue() {
-                    synchronized (CANONICAL_ID_FORMATTER) {
-                        return (SimpleDateFormat) CANONICAL_ID_FORMATTER.clone();
-                    }
-                }
-            };
-
     /**
      * Creates a new {@link Run}.
+     * @param job Owner job
      */
-    protected Run(JobT job) throws IOException {
-        this(job, new GregorianCalendar());
+    protected Run(@Nonnull JobT job) throws IOException {
+        this(job, System.currentTimeMillis());
         this.number = project.assignBuildNumber();
         LOGGER.log(FINER, "new {0} @{1}", new Object[] {this, hashCode()});
     }
@@ -288,24 +291,29 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     /**
      * Constructor for creating a {@link Run} object in
      * an arbitrary state.
+     * {@link #number} must be set manually.
+     * <p>May be used in a {@link SubTask#createExecutable} (instead of calling {@link LazyBuildMixIn#newBuild}).
+     * For example, {@code MatrixConfiguration.newBuild} does this
+     * so that the {@link #timestamp} as well as {@link #number} are shared with the parent build.
      */
-    protected Run(JobT job, Calendar timestamp) {
+    protected Run(@Nonnull JobT job, @Nonnull Calendar timestamp) {
         this(job,timestamp.getTimeInMillis());
     }
 
-    protected Run(JobT job, long timestamp) {
+    /** @see #Run(Job, Calendar) */
+    protected Run(@Nonnull JobT job, long timestamp) {
         this.project = job;
         this.timestamp = timestamp;
         this.state = State.NOT_STARTED;
-		getRootDir().mkdirs();
     }
 
     /**
      * Loads a run from a log file.
      */
-    protected Run(JobT project, File buildDir) throws IOException {
-        this(project, parseTimestampFromBuildDir(buildDir));
+    protected Run(@Nonnull JobT project, @Nonnull File buildDir) throws IOException {
+        this.project = project;
         this.previousBuildInProgress = _this(); // loaded builds are always completed
+        number = Integer.parseInt(buildDir.getName());
         reload();
     }
 
@@ -337,7 +345,12 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     protected void onLoad() {
         for (Action a : getAllActions()) {
             if (a instanceof RunAction2) {
-                ((RunAction2) a).onLoad(this);
+                try {
+                    ((RunAction2) a).onLoad(this);
+                } catch (RuntimeException x) {
+                    LOGGER.log(WARNING, "failed to load " + a + " from " + getDataFile(), x);
+                    getActions().remove(a); // if possible; might be in an inconsistent state
+                }
             } else if (a instanceof RunAction) {
                 ((RunAction) a).onLoad();
             }
@@ -357,8 +370,13 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     public List<Action> getTransientActions() {
         List<Action> actions = new ArrayList<Action>();
         for (TransientBuildActionFactory factory: TransientBuildActionFactory.all()) {
-            actions.addAll(factory.createFor(this));
-            assert !actions.contains(null) : "null action added by " + factory;
+            for (Action created : factory.createFor(this)) {
+                if (created == null) {
+                    LOGGER.log(WARNING, "null action added by {0}", factory);
+                    continue;
+                }
+                actions.add(created);
+            }
         }
         return Collections.unmodifiableList(actions);
     }
@@ -369,7 +387,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      */
     @SuppressWarnings("deprecation")
     @Override
-    public void addAction(Action a) {
+    public void addAction(@Nonnull Action a) {
         super.addAction(a);
         if (a instanceof RunAction2) {
             ((RunAction2) a).onAttached(this);
@@ -378,45 +396,41 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         }
     }
 
-    static class InvalidDirectoryNameException extends IOException {
-        InvalidDirectoryNameException(File buildDir) {
-            super("Invalid directory name " + buildDir);
-        }
-    }
-
-    /*package*/ static long parseTimestampFromBuildDir(File buildDir) throws IOException, InvalidDirectoryNameException {
-        try {
-            if(Util.isSymlink(buildDir)) {
-                // "Util.resolveSymlink(file)" resolves NTFS symlinks. 
-                File target = Util.resolveSymlinkToFile(buildDir);
-                if(target != null)
-                    buildDir = target;
-            }
-            // canonicalization to ensure we are looking at the ID in the directory name
-            // as opposed to build numbers which are used in symlinks
-            // (just in case the symlink check above did not work)
-            buildDir = buildDir.getCanonicalFile();
-            return ID_FORMATTER.get().parse(buildDir.getName()).getTime();
-        } catch (ParseException e) {
-            throw new InvalidDirectoryNameException(buildDir);
-        } catch (InterruptedException e) {
-            throw new IOException("Interrupted while resolving symlink directory "+buildDir,e);
-        }
-    }
-
     /**
      * Obtains 'this' in a more type safe signature.
-     */
+     */   
     @SuppressWarnings({"unchecked"})
-    protected RunT _this() {
+    protected @Nonnull RunT _this() {
         return (RunT)this;
     }
 
     /**
      * Ordering based on build numbers.
      */
-    public int compareTo(RunT that) {
+    public int compareTo(@Nonnull RunT that) {
         return this.number - that.number;
+    }
+
+    /**
+     * Get the {@link Queue.Item#getId()} of the original queue item from where this Run instance
+     * originated.
+     * @return The queue item ID.
+     * @since 1.601
+     */
+    @Exported
+    public long getQueueId() {
+        return queueId;
+    }
+
+    /**
+     * Set the queue item ID.
+     * <p/>
+     * Mapped from the {@link Queue.Item#getId()}.
+     * @param queueId The queue item ID.
+     */
+    @Restricted(NoExternalUse.class)
+    public void setQueueId(long queueId) {
+        this.queueId = queueId;
     }
 
     /**
@@ -432,9 +446,18 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         return result;
     }
 
-    public void setResult(Result r) {
-        // state can change only when we are building
-        assert state==State.BUILDING : state;
+    /**
+     * Sets the {@link #getResult} of this build.
+     * Has no effect when the result is already set and worse than the proposed result.
+     * May only be called after the build has started and before it has moved into post-production
+     * (normally meaning both {@link #isInProgress} and {@link #isBuilding} are true).
+     * @param r the proposed new result
+     * @throws IllegalStateException if the build has not yet started, is in post-production, or is complete
+     */
+    public void setResult(@Nonnull Result r) {
+        if (state != State.BUILDING) {
+            throw new IllegalStateException("cannot change build result while in " + state);
+        }
 
         // result can only get worse
         if (result==null || r.isWorseThan(result)) {
@@ -446,7 +469,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     /**
      * Gets the subset of {@link #getActions()} that consists of {@link BuildBadgeAction}s.
      */
-    public List<BuildBadgeAction> getBadgeActions() {
+    public @Nonnull List<BuildBadgeAction> getBadgeActions() {
         List<BuildBadgeAction> r = getActions(BuildBadgeAction.class);
         if(isKeepLog()) {
             r.add(new KeepLogBuildBadge());
@@ -487,20 +510,11 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * and because of that this might not be necessarily in sync with the return value of {@link #isBuilding()} &mdash;
      * an executor holds on to {@link Run} some more time even after the build is finished (for example to
      * perform {@linkplain Run.State#POST_PRODUCTION post-production processing}.)
+     * @see Executables#getExecutor
      */
     @Exported 
     public @CheckForNull Executor getExecutor() {
-        Jenkins j = Jenkins.getInstance();
-        if (j == null) {
-            return null;
-        }
-        for (Computer c : j.getComputers()) {
-            for (Executor e : c.getExecutors()) {
-                if(e.getCurrentExecutable()==this)
-                    return e;
-            }
-        }
-        return null;
+        return this instanceof Queue.Executable ? Executor.of((Queue.Executable) this) : null;
     }
 
     /**
@@ -508,7 +522,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * Otherwise null.
      * @since 1.433 
      */
-    public Executor getOneOffExecutor() {
+    public @CheckForNull Executor getOneOffExecutor() {
         for( Computer c : Jenkins.getInstance().getComputers() ) {
             for (Executor e : c.getOneOffExecutors()) {
                 if(e.getCurrentExecutable()==this)
@@ -522,14 +536,14 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * Gets the charset in which the log file is written.
      * @return never null.
      * @since 1.257
-     */
-    public final Charset getCharset() {
+     */   
+    public final @Nonnull Charset getCharset() {
         if(charset==null)   return Charset.defaultCharset();
         return Charset.forName(charset);
     }
 
     /**
-     * Returns the {@link Cause}s that tirggered a build.
+     * Returns the {@link Cause}s that triggered a build.
      *
      * <p>
      * If a build sits in the queue for a long time, multiple build requests made during this period
@@ -539,7 +553,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      *      can be empty but never null. read-only.
      * @since 1.321
      */
-    public List<Cause> getCauses() {
+    public @Nonnull List<Cause> getCauses() {
         CauseAction a = getAction(CauseAction.class);
         if (a==null)    return Collections.emptyList();
         return Collections.unmodifiableList(a.getCauses());
@@ -549,8 +563,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * Returns a {@link Cause} of a particular type.
      *
      * @since 1.362
-     */
-    public <T extends Cause> T getCause(Class<T> type) {
+     */ 
+    public @CheckForNull <T extends Cause> T getCause(Class<T> type) {
         for (Cause c : getCauses())
             if (type.isInstance(c))
                 return type.cast(c);
@@ -570,8 +584,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     /**
      * If {@link #isKeepLog()} returns true, returns a short, human-readable
      * sentence that explains why it's being kept.
-     */
-    public String getWhyKeepLog() {
+     */ 
+    public @CheckForNull String getWhyKeepLog() {
         if(keepLog)
             return Messages.Run_MarkedExplicitly();
         return null;    // not marked at all
@@ -579,8 +593,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     /**
      * The project this build is for.
-     */
-    public JobT getParent() {
+     */ 
+    public @Nonnull JobT getParent() {
         return project;
     }
 
@@ -588,9 +602,9 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * When the build is scheduled.
      *
      * @see #getStartTimeInMillis()
-     */
+     */   
     @Exported
-    public Calendar getTimestamp() {
+    public @Nonnull Calendar getTimestamp() {
         GregorianCalendar c = new GregorianCalendar();
         c.setTimeInMillis(timestamp);
         return c;
@@ -598,8 +612,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     /**
      * Same as {@link #getTimestamp()} but in a different type.
-     */
-    public final Date getTime() {
+     */   
+    public final @Nonnull Date getTime() {
         return new Date(timestamp);
     }
 
@@ -613,7 +627,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     /**
      * When the build has started running in an executor.
      *
-     * For example, if a build is scheduled 1pm, and stayed in the queue for 1 hour (say, no idle slaves),
+     * For example, if a build is scheduled 1pm, and stayed in the queue for 1 hour (say, no idle agents),
      * then this method returns 2pm, which is the time the job moved from the queue to the building state.
      *
      * @see #getTimestamp()
@@ -632,8 +646,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     /**
      * Returns the length-limited description.
      * @return The length-limited description.
-     */
-    public String getTruncatedDescription() {
+     */   
+    public @Nonnull String getTruncatedDescription() {
         final int maxDescrLength = 100;
         if (description == null || description.length() < maxDescrLength) {
             return description;
@@ -684,7 +698,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * @return
      *      string like "3 minutes" "1 day" etc.
      */
-    public String getTimestampString() {
+    public @Nonnull String getTimestampString() {
         long duration = new GregorianCalendar().getTimeInMillis()-timestamp;
         return Util.getPastTimeString(duration);
     }
@@ -692,17 +706,20 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     /**
      * Returns the timestamp formatted in xs:dateTime.
      */
-    public String getTimestampString2() {
+    public @Nonnull String getTimestampString2() {
         return Util.XS_DATETIME_FORMATTER.format(new Date(timestamp));
     }
 
     /**
      * Gets the string that says how long the build took to run.
      */
-    public String getDurationString() {
-        if(isBuilding())
+    public @Nonnull String getDurationString() {
+        if (hasntStartedYet()) {
+            return Messages.Run_NotStartedYet();
+        } else if (isBuilding()) {
             return Messages.Run_InProgressDuration(
-                    Util.getTimeSpanString(System.currentTimeMillis()-timestamp));
+                    Util.getTimeSpanString(System.currentTimeMillis()-startTime));
+        }
         return Util.getTimeSpanString(duration);
     }
 
@@ -717,7 +734,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     /**
      * Gets the icon color for display.
      */
-    public BallColor getIconColor() {
+    public @Nonnull BallColor getIconColor() {
         if(!isBuilding()) {
             // already built
             return getResult().color;
@@ -751,6 +768,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         return project.getFullDisplayName()+' '+getDisplayName();
     }
 
+    @Exported
     public String getDisplayName() {
         return displayName!=null ? displayName : "#"+number;
     }
@@ -776,10 +794,11 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     /**
      * Called by {@link RunMap} to obtain a reference to this run.
+     * @return Reference to the build. Never null
      * @see jenkins.model.lazy.LazyBuildMixIn.RunMixIn#createReference
      * @since 1.556
-     */
-    protected BuildReference<RunT> createReference() {
+     */   
+    protected @Nonnull BuildReference<RunT> createReference() {
         return new BuildReference<RunT>(getId(), _this());
     }
 
@@ -798,15 +817,15 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     /**
      * @see jenkins.model.lazy.LazyBuildMixIn.RunMixIn#getPreviousBuild
-     */
-    public RunT getPreviousBuild() {
+     */  
+    public @CheckForNull RunT getPreviousBuild() {
         return previousBuild;
     }
 
     /**
      * Gets the most recent {@linkplain #isBuilding() completed} build excluding 'this' Run itself.
-     */
-    public final RunT getPreviousCompletedBuild() {
+     */   
+    public final @CheckForNull RunT getPreviousCompletedBuild() {
         RunT r=getPreviousBuild();
         while (r!=null && r.isBuilding())
             r=r.getPreviousBuild();
@@ -820,8 +839,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * <p>
      * We basically follow the existing skip list, and wherever we find a non-optimal pointer, we remember them
      * in 'fixUp' and update them later.
-     */
-    public final RunT getPreviousBuildInProgress() {
+     */  
+    public final @CheckForNull RunT getPreviousBuildInProgress() {
         if(previousBuildInProgress==this)   return null;    // the most common case
 
         List<RunT> fixUp = new ArrayList<RunT>();
@@ -856,8 +875,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     /**
      * Returns the last build that was actually built - i.e., skipping any with Result.NOT_BUILT
-     */
-    public RunT getPreviousBuiltBuild() {
+     */ 
+    public @CheckForNull RunT getPreviousBuiltBuild() {
         RunT r=getPreviousBuild();
         // in certain situations (aborted m2 builds) r.getResult() can still be null, although it should theoretically never happen
         while( r!=null && (r.getResult() == null || r.getResult()==Result.NOT_BUILT) )
@@ -867,8 +886,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     /**
      * Returns the last build that didn't fail before this build.
-     */
-    public RunT getPreviousNotFailedBuild() {
+     */ 
+    public @CheckForNull RunT getPreviousNotFailedBuild() {
         RunT r=getPreviousBuild();
         while( r!=null && r.getResult()==Result.FAILURE )
             r=r.getPreviousBuild();
@@ -877,8 +896,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     /**
      * Returns the last failed build before this build.
-     */
-    public RunT getPreviousFailedBuild() {
+     */  
+    public @CheckForNull RunT getPreviousFailedBuild() {
         RunT r=getPreviousBuild();
         while( r!=null && r.getResult()!=Result.FAILURE )
             r=r.getPreviousBuild();
@@ -889,7 +908,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * Returns the last successful build before this build.
      * @since 1.383
      */
-    public RunT getPreviousSuccessfulBuild() {
+    public @CheckForNull RunT getPreviousSuccessfulBuild() {
         RunT r=getPreviousBuild();
         while( r!=null && r.getResult()!=Result.SUCCESS )
             r=r.getPreviousBuild();
@@ -905,8 +924,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      *   May be smaller than 'numberOfBuilds' or even empty
      *   if not enough builds satisfying the threshold have been found. Never null.
      * @since 1.383
-     */
-    public List<RunT> getPreviousBuildsOverThreshold(int numberOfBuilds, Result threshold) {
+     */  
+    public @Nonnull List<RunT> getPreviousBuildsOverThreshold(int numberOfBuilds, @Nonnull Result threshold) {
         List<RunT> builds = new ArrayList<RunT>(numberOfBuilds);
         
         RunT r = getPreviousBuild();
@@ -923,8 +942,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     /**
      * @see jenkins.model.lazy.LazyBuildMixIn.RunMixIn#getNextBuild
-     */
-    public RunT getNextBuild() {
+     */   
+    public @CheckForNull RunT getNextBuild() {
         return nextBuild;
     }
 
@@ -936,7 +955,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      */
     // I really messed this up. I'm hoping to fix this some time
     // it shouldn't have trailing '/', and instead it should have leading '/'
-    public String getUrl() {
+    public @Nonnull String getUrl() {
 
         // RUN may be accessed using permalinks, as "/lastSuccessful" or other, so try to retrieve this base URL
         // looking for "this" in the current request ancestors
@@ -962,42 +981,37 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      *      This method is only intended for the remote API clients who cannot resolve relative references.
      */
     @Exported(visibility=2,name="url")
-    public final String getAbsoluteUrl() {
+    @Deprecated
+    public final @Nonnull String getAbsoluteUrl() {
         return project.getAbsoluteUrl()+getNumber()+'/';
     }
 
-    public final String getSearchUrl() {
+    public final @Nonnull String getSearchUrl() {
         return getNumber()+"/";
     }
 
     /**
      * Unique ID of this build.
+     * Usually the decimal form of {@link #number}, but may be a formatted timestamp for historical builds.
      */
     @Exported
-    public String getId() {
-        return ID_FORMATTER.get().format(new Date(timestamp));
+    public @Nonnull String getId() {
+        return id != null ? id : Integer.toString(number);
     }
     
-    /**
-     * Get the date formatter used to convert the directory name in to a timestamp
-     * This is nasty exposure of private data, but needed all the time the directory
-     * containing the build is used as it's timestamp.
-     */
-    public static DateFormat getIDFormatter() {
-    	return ID_FORMATTER.get();
-    }
-
-    public Descriptor getDescriptorByName(String className) {
+    @Override
+    public @CheckForNull Descriptor getDescriptorByName(String className) {
         return Jenkins.getInstance().getDescriptorByName(className);
     }
 
     /**
-     * Root directory of this {@link Run} on the master.
-     *
+     * Get the root directory of this {@link Run} on the master.
      * Files related to this {@link Run} should be stored below this directory.
+     * @return Root directory of this {@link Run} on the master. Never null
      */
-    public File getRootDir() {
-        return new File(project.getBuildDir(),getId());
+    @Override
+    public @Nonnull File getRootDir() {
+        return new File(project.getBuildDir(), Integer.toString(number));
     }
 
     /**
@@ -1053,19 +1067,21 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     /**
      * Gets the artifacts (relative to {@link #getArtifactsDir()}.
-     */
-    @Exported
-    public List<Artifact> getArtifacts() {
+     * @return The list can be empty but never null
+     */    
+    @Exported  
+    public @Nonnull List<Artifact> getArtifacts() {
         return getArtifactsUpTo(Integer.MAX_VALUE);
     }
 
     /**
      * Gets the first N artifacts.
-     */
-    public List<Artifact> getArtifactsUpTo(int n) {
+     * @return The list can be empty but never null
+     */ 
+    public @Nonnull List<Artifact> getArtifactsUpTo(int artifactsNumber) {
         ArtifactList r = new ArtifactList();
         try {
-            addArtifacts(getArtifactManager().root(), "", "", r, null, n);
+            addArtifacts(getArtifactManager().root(), "", "", r, null, artifactsNumber);
         } catch (IOException x) {
             LOGGER.log(Level.WARNING, null, x);
         }
@@ -1074,16 +1090,17 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     }
 
     /**
-     * Returns true if this run has any artifacts.
-     *
-     * <p>
+     * Check if the {@link Run} contains artifacts.
      * The strange method name is so that we can access it from EL.
+     * @return true if this run has any artifacts
      */
     public boolean getHasArtifacts() {
         return !getArtifactsUpTo(1).isEmpty();
     }
 
-    private int addArtifacts(VirtualFile dir, String path, String pathHref, ArtifactList r, Artifact parent, int upTo) throws IOException {
+    private int addArtifacts(@Nonnull VirtualFile dir, 
+            @Nonnull String path, @Nonnull String pathHref, 
+            @Nonnull ArtifactList r, @Nonnull Artifact parent, int upTo) throws IOException {
         VirtualFile[] kids = dir.list();
         Arrays.sort(kids);
 
@@ -1123,12 +1140,12 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     /**
      * Maximum number of artifacts to list before using switching to the tree view.
      */
-    public static final int LIST_CUTOFF = Integer.parseInt(System.getProperty("hudson.model.Run.ArtifactList.listCutoff", "16"));
+    public static final int LIST_CUTOFF = Integer.parseInt(SystemProperties.getString("hudson.model.Run.ArtifactList.listCutoff", "16"));
 
     /**
      * Maximum number of artifacts to show in tree view before just showing a link.
      */
-    public static final int TREE_CUTOFF = Integer.parseInt(System.getProperty("hudson.model.Run.ArtifactList.treeCutoff", "40"));
+    public static final int TREE_CUTOFF = Integer.parseInt(SystemProperties.getString("hudson.model.Run.ArtifactList.treeCutoff", "40"));
 
     // ..and then "too many"
 
@@ -1267,7 +1284,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
          * @deprecated May not be meaningful with custom artifact managers. Use {@link ArtifactManager#root} plus {@link VirtualFile#child} with {@link #relativePath} instead.
          */
         @Deprecated
-        public File getFile() {
+        public @Nonnull File getFile() {
             return new File(getArtifactsDir(),relativePath);
         }
 
@@ -1308,8 +1325,9 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     /**
      * Returns the log file.
-     */
-    public File getLogFile() {
+     * @return The file may reference both uncompressed or compressed logs
+     */  
+    public @Nonnull File getLogFile() {
         File rawF = new File(getRootDir(), "log");
         if (rawF.isFile()) {
             return rawF;
@@ -1327,13 +1345,14 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * It will use a gzip-compressed log file (log.gz) if that exists.
      *
      * @throws IOException 
-     * @return an input stream from the log file, or null if none exists
+     * @return An input stream from the log file. 
+     *   If the log file does not exist, the error message will be returned to the output.
      * @since 1.349
      */
-    public InputStream getLogInputStream() throws IOException {
+    public @Nonnull InputStream getLogInputStream() throws IOException {
     	File logFile = getLogFile();
     	
-    	if (logFile != null && logFile.exists() ) {
+    	if (logFile.exists() ) {
     	    // Checking if a ".gz" file was return
     	    FileInputStream fis = new FileInputStream(logFile);
     	    if (logFile.getName().endsWith(".gz")) {
@@ -1346,8 +1365,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         String message = "No such file: " + logFile;
     	return new ByteArrayInputStream(charset != null ? message.getBytes(charset) : message.getBytes());
     }
-
-    public Reader getLogReader() throws IOException {
+   
+    public @Nonnull Reader getLogReader() throws IOException {
         if (charset==null)  return new InputStreamReader(getLogInputStream());
         else                return new InputStreamReader(getLogInputStream(),charset);
     }
@@ -1357,7 +1376,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      *
      * @since 1.349
      */
-    public void writeLogTo(long offset, XMLOutput out) throws IOException {
+    public void writeLogTo(long offset, @Nonnull XMLOutput out) throws IOException {
         try {
 			getLogText().writeHtmlTo(offset,out.asWriter());
 		} catch (IOException e) {
@@ -1378,8 +1397,10 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      *
      * If someone is still writing to the log, this method will not return until the whole log
      * file gets written out.
+     * <p/>
+     * The method does not close the {@link OutputStream}.
      */
-    public void writeWholeLogTo(OutputStream out) throws IOException, InterruptedException {
+    public void writeWholeLogTo(@Nonnull OutputStream out) throws IOException, InterruptedException {
         long pos = 0;
         AnnotatedLargeText logText;
         logText = getLogText();
@@ -1396,13 +1417,14 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     /**
      * Used to URL-bind {@link AnnotatedLargeText}.
-     */
-    public AnnotatedLargeText getLogText() {
+     * @return A {@link Run} log with annotations
+     */   
+    public @Nonnull AnnotatedLargeText getLogText() {
         return new AnnotatedLargeText(getLogFile(),getCharset(),!isLogUpdated(),this);
     }
 
     @Override
-    protected SearchIndexBuilder makeSearchIndex() {
+    protected @Nonnull SearchIndexBuilder makeSearchIndex() {
         SearchIndexBuilder builder = super.makeSearchIndex()
                 .add("console")
                 .add("changes");
@@ -1413,18 +1435,21 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         return builder;
     }
 
-    public Api getApi() {
+    public @Nonnull Api getApi() {
         return new Api(this);
     }
 
-    public void checkPermission(Permission p) {
+    @Override
+    public void checkPermission(@Nonnull Permission p) {
         getACL().checkPermission(p);
     }
 
-    public boolean hasPermission(Permission p) {
+    @Override
+    public boolean hasPermission(@Nonnull Permission p) {
         return getACL().hasPermission(p);
     }
 
+    @Override
     public ACL getACL() {
         // for now, don't maintain ACL per run, and do it at project level
         return getParent().getACL();
@@ -1461,10 +1486,6 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         RunListener.fireDeleted(this);
 
         synchronized (this) { // avoid holding a lock while calling plugin impls of onDeleted
-        // if we have a symlink, delete it, too
-        File link = new File(project.getBuildDir(), String.valueOf(getNumber()));
-        link.delete();
-
         File tmp = new File(rootDir.getParentFile(),'.'+rootDir.getName());
         
         if (tmp.exists()) {
@@ -1495,16 +1516,24 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     /**
      * @see CheckPoint#report()
      */
-    /*package*/ static void reportCheckpoint(CheckPoint id) {
-        RunnerStack.INSTANCE.peek().checkpoints.report(id);
+    /*package*/ static void reportCheckpoint(@Nonnull CheckPoint id) {
+        Run<?,?>.RunExecution exec = RunnerStack.INSTANCE.peek();
+        if (exec == null) {
+            return;
+        }
+        exec.checkpoints.report(id);
     }
 
     /**
      * @see CheckPoint#block()
      */
-    /*package*/ static void waitForCheckpoint(CheckPoint id, @CheckForNull BuildListener listener, @CheckForNull String waiter) throws InterruptedException {
+    /*package*/ static void waitForCheckpoint(@Nonnull CheckPoint id, @CheckForNull BuildListener listener, @CheckForNull String waiter) throws InterruptedException {
         while(true) {
-            Run b = RunnerStack.INSTANCE.peek().getBuild().getPreviousBuildInProgress();
+            Run<?,?>.RunExecution exec = RunnerStack.INSTANCE.peek();
+            if (exec == null) {
+                return;
+            }
+            Run b = exec.getBuild().getPreviousBuildInProgress();
             if(b==null)     return; // no pending earlier build
             Run.RunExecution runner = b.runner;
             if(runner==null) {
@@ -1523,6 +1552,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * @deprecated as of 1.467
      *      Please use {@link RunExecution}
      */
+    @Deprecated
     protected abstract class Runner extends RunExecution {}
 
     /**
@@ -1543,12 +1573,12 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
             private boolean allDone;
 
-            protected synchronized void report(CheckPoint identifier) {
+            protected synchronized void report(@Nonnull CheckPoint identifier) {
                 checkpoints.add(identifier);
                 notifyAll();
             }
 
-            protected synchronized boolean waitForCheckPoint(CheckPoint identifier, @CheckForNull BuildListener listener, @CheckForNull String waiter) throws InterruptedException {
+            protected synchronized boolean waitForCheckPoint(@Nonnull CheckPoint identifier, @CheckForNull BuildListener listener, @CheckForNull String waiter) throws InterruptedException {
                 final Thread t = Thread.currentThread();
                 final String oldName = t.getName();
                 t.setName(oldName + " : waiting for " + identifier + " on " + getFullDisplayName() + " from " + waiter);
@@ -1586,7 +1616,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
          * @throws Exception
          *      exception will be recorded and the build will be considered a failure.
          */
-        public abstract Result run( BuildListener listener ) throws Exception, RunnerAbortedException;
+        public abstract @Nonnull Result run(@Nonnull BuildListener listener ) throws Exception, RunnerAbortedException;
 
         /**
          * Performs the post-build action.
@@ -1598,7 +1628,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
          * even if the build is successful, this build still won't be picked up
          * by {@link Job#getLastSuccessfulBuild()}.
          */
-        public abstract void post( BuildListener listener ) throws Exception;
+        public abstract void post(@Nonnull BuildListener listener ) throws Exception;
 
         /**
          * Performs final clean up action.
@@ -1612,11 +1642,11 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
          */
         public abstract void cleanUp(@Nonnull BuildListener listener) throws Exception;
 
-        public RunT getBuild() {
+        public @Nonnull RunT getBuild() {
             return _this();
         }
 
-        public JobT getProject() {
+        public @Nonnull JobT getProject() {
             return _this().getParent();
         }
 
@@ -1626,7 +1656,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
          *
          * @since 1.473
          */
-        public Map<Object,Object> getAttributes() {
+        public @Nonnull Map<Object,Object> getAttributes() {
             return attributes;
         }
     }
@@ -1644,11 +1674,12 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * @deprecated as of 1.467
      *      Use {@link #execute(RunExecution)}
      */
-    protected final void run(Runner job) {
+    @Deprecated
+    protected final void run(@Nonnull Runner job) {
         execute(job);
     }
 
-    protected final void execute(RunExecution job) {
+    protected final void execute(@Nonnull RunExecution job) {
         if(result!=null)
             return;     // already built.
 
@@ -1670,28 +1701,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
                         charset = computer.getDefaultCharset();
                         this.charset = charset.name();
                     }
-
-                    // don't do buffering so that what's written to the listener
-                    // gets reflected to the file immediately, which can then be
-                    // served to the browser immediately
-                    OutputStream logger = new FileOutputStream(getLogFile());
-                    RunT build = job.getBuild();
-
-                    // Global log filters
-                    for (ConsoleLogFilter filter : ConsoleLogFilter.all()) {
-                        logger = filter.decorateLogger((AbstractBuild) build, logger);
-                    }
-
-                    // Project specific log filters
-                    if (project instanceof BuildableItemWithBuildWrappers && build instanceof AbstractBuild) {
-                        BuildableItemWithBuildWrappers biwbw = (BuildableItemWithBuildWrappers) project;
-                        for (BuildWrapper bw : biwbw.getBuildWrappersList()) {
-                            logger = bw.decorateLogger((AbstractBuild) build, logger);
-                        }
-                    }
-
-                    listener = new StreamBuildListener(logger,charset);
-
+                    listener = createBuildListener(job, listener, charset);
                     listener.started(getCauses());
 
                     Authentication auth = Jenkins.getAuthentication();
@@ -1752,13 +1762,13 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
                 state = State.POST_PRODUCTION;
 
                 if (listener != null) {
+                    RunListener.fireCompleted(this,listener);
                     try {
                         job.cleanUp(listener);
                     } catch (Exception e) {
                         handleFatalBuildProblem(listener,e);
                         // too late to update the result now
                     }
-                    RunListener.fireCompleted(this,listener);
                     listener.finished(result);
                     listener.closeQuietly();
                 }
@@ -1772,19 +1782,40 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
             try {
                 getParent().logRotate();
-            } catch (IOException e) {
-                LOGGER.log(Level.SEVERE, "Failed to rotate log",e);
-            } catch (InterruptedException e) {
-                LOGGER.log(Level.SEVERE, "Failed to rotate log",e);
-            }
+            } catch (Exception e) {
+		LOGGER.log(Level.SEVERE, "Failed to rotate log",e);
+	    }
         } finally {
             onEndBuilding();
         }
     }
 
+    private StreamBuildListener createBuildListener(@Nonnull RunExecution job, StreamBuildListener listener, Charset charset) throws IOException, InterruptedException {
+        // don't do buffering so that what's written to the listener
+        // gets reflected to the file immediately, which can then be
+        // served to the browser immediately
+        OutputStream logger = new FileOutputStream(getLogFile(), true);
+        RunT build = job.getBuild();
+
+        // Global log filters
+        for (ConsoleLogFilter filter : ConsoleLogFilter.all()) {
+            logger = filter.decorateLogger(build, logger);
+        }
+
+        // Project specific log filters
+        if (project instanceof BuildableItemWithBuildWrappers && build instanceof AbstractBuild) {
+            BuildableItemWithBuildWrappers biwbw = (BuildableItemWithBuildWrappers) project;
+            for (BuildWrapper bw : biwbw.getBuildWrappersList()) {
+                logger = bw.decorateLogger((AbstractBuild) build, logger);
+            }
+        }
+
+        listener = new StreamBuildListener(logger,charset);
+        return listener;
+    }
+
     /**
-     * Creates a symlink from build number to ID.
-     * Also makes sure that {@code lastSuccessful} and {@code lastStable} legacy links in the project’s root directory exist.
+     * Makes sure that {@code lastSuccessful} and {@code lastStable} legacy links in the project’s root directory exist.
      * Normally you do not need to call this explicitly, since {@link #execute} does so,
      * but this may be needed if you are creating synthetic {@link Run}s as part of a container project (such as Maven builds in a module set).
      * You should also ensure that {@link RunListener#fireStarted} and {@link RunListener#fireCompleted} are called.
@@ -1792,8 +1823,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * @throws InterruptedException probably not thrown
      * @since 1.530
      */
-    public final void updateSymlinks(TaskListener listener) throws InterruptedException {
-        Util.createSymlink(getParent().getBuildDir(), getId(), String.valueOf(getNumber()), listener);
+    public final void updateSymlinks(@Nonnull TaskListener listener) throws InterruptedException {
         createSymlink(listener, "lastSuccessful", PermalinkProjectAction.Permalink.LAST_SUCCESSFUL_BUILD);
         createSymlink(listener, "lastStable", PermalinkProjectAction.Permalink.LAST_STABLE_BUILD);
     }
@@ -1804,7 +1834,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * builds, but now those are done in {@link PeepholePermalink}. So here, we simply create symlinks that
      * resolves to the symlink created by {@link PeepholePermalink}.
      */
-    private void createSymlink(TaskListener listener, String name, PermalinkProjectAction.Permalink target) throws InterruptedException {
+    private void createSymlink(@Nonnull TaskListener listener, @Nonnull String name, @Nonnull PermalinkProjectAction.Permalink target) throws InterruptedException {
         File buildDir = getParent().getBuildDir();
         File rootDir = getParent().getRootDir();
         String targetDir;
@@ -1819,22 +1849,14 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     /**
      * Handles a fatal build problem (exception) that occurred during the build.
      */
-    private void handleFatalBuildProblem(BuildListener listener, Throwable e) {
+    private void handleFatalBuildProblem(@Nonnull BuildListener listener, @Nonnull Throwable e) {
         if(listener!=null) {
             LOGGER.log(FINE, getDisplayName()+" failed to build",e);
 
             if(e instanceof IOException)
                 Util.displayIOException((IOException)e,listener);
 
-            Writer w = listener.fatalError(e.getMessage());
-            if(w!=null) {
-                try {
-                    e.printStackTrace(new PrintWriter(w));
-                    w.close();
-                } catch (IOException e1) {
-                    // ignore
-                }
-            }
+            e.printStackTrace(listener.fatalError(e.getMessage()));
         } else {
             LOGGER.log(SEVERE, getDisplayName()+" failed to build and we don't even have a listener",e);
         }
@@ -1849,6 +1871,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         startTime = System.currentTimeMillis();
         if (runner!=null)
             RunnerStack.INSTANCE.push(runner);
+        RunListener.fireInitialize(this);
     }
 
     /**
@@ -1881,19 +1904,19 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         SaveableListener.fireOnChange(this, getDataFile());
     }
 
-    private XmlFile getDataFile() {
+    private @Nonnull XmlFile getDataFile() {
         return new XmlFile(XSTREAM,new File(getRootDir(),"build.xml"));
     }
 
     /**
      * Gets the log of the build as a string.
-     *
+     * @return Returns the log or an empty string if it has not been found
      * @deprecated since 2007-11-11.
      *     Use {@link #getLog(int)} instead as it avoids loading
      *     the whole log into memory unnecessarily.
      */
     @Deprecated
-    public String getLog() throws IOException {
+    public @Nonnull String getLog() throws IOException {
         return Util.loadFile(getLogFile(),getCharset());
     }
 
@@ -1906,9 +1929,12 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * @return A list of log lines.  Will have no more than maxLines elements.
      * @throws IOException If there is a problem reading the log file.
      */
-    public List<String> getLog(int maxLines) throws IOException {
+    public @Nonnull List<String> getLog(int maxLines) throws IOException {
         int lineCount = 0;
         List<String> logLines = new LinkedList<String>();
+        if (maxLines == 0) {
+            return logLines;
+        }
         BufferedReader reader = new BufferedReader(new InputStreamReader(new FileInputStream(getLogFile()),getCharset()));
         try {
             for (String line = reader.readLine(); line != null; line = reader.readLine()) {
@@ -1938,8 +1964,12 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         rsp.sendRedirect2(req.getContextPath()+"/images/48x48/"+getBuildStatusUrl());
     }
 
-    public String getBuildStatusUrl() {
+    public @Nonnull String getBuildStatusUrl() {
         return getIconColor().getImage();
+    }
+
+    public String getBuildStatusIconClassName() {
+        return getIconColor().getIconClassName();
     }
 
     public static class Summary {
@@ -1956,16 +1986,38 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     }
 
     /**
+     * Used to implement {@link #getBuildStatusSummary}.
+     * @since 1.575
+     */
+    public static abstract class StatusSummarizer implements ExtensionPoint {
+        /**
+         * Possibly summarizes the reasons for a build’s status.
+         * @param run a completed build
+         * @param trend the result of {@link ResultTrend#getResultTrend(hudson.model.Run)} on {@code run} (precomputed for efficiency)
+         * @return a summary, or null to fall back to other summarizers or built-in behavior
+         */
+        public abstract @CheckForNull Summary summarize(@Nonnull Run<?,?> run, @Nonnull ResultTrend trend);
+    }
+
+    /**
      * Gets an object which represents the single line summary of the status of this build
      * (especially in comparison with the previous build.)
+     * @see StatusSummarizer
      */
-    public Summary getBuildStatusSummary() {
+    public @Nonnull Summary getBuildStatusSummary() {
         if (isBuilding()) {
             return new Summary(false, Messages.Run_Summary_Unknown());
         }
         
         ResultTrend trend = ResultTrend.getResultTrend(this);
         
+        for (StatusSummarizer summarizer : ExtensionList.lookup(StatusSummarizer.class)) {
+            Summary summary = summarizer.summarize(this, trend);
+            if (summary != null) {
+                return summary;
+            }
+        }
+
         switch (trend) {
             case ABORTED : return new Summary(false, Messages.Run_Summary_Aborted());
             
@@ -1981,11 +2033,10 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
                 return new Summary(false, Messages.Run_Summary_BrokenSince(failedBuild.getDisplayName()));
            
             case NOW_UNSTABLE:
-                return determineDetailedUnstableSummary(Boolean.FALSE);
-            case UNSTABLE :
-                return determineDetailedUnstableSummary(Boolean.TRUE);
             case STILL_UNSTABLE :
-                return determineDetailedUnstableSummary(null);
+                return new Summary(false, Messages.Run_Summary_Unstable());
+            case UNSTABLE :
+                return new Summary(true, Messages.Run_Summary_Unstable());
                 
             case SUCCESS :
                 return new Summary(false, Messages.Run_Summary_Stable());
@@ -1999,48 +2050,14 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     }
 
     /**
-     * @param worseOverride override the 'worse' parameter to this value.
-     *   May be null in which case 'worse' is calculated based on the number of failed tests.
-     */
-    private Summary determineDetailedUnstableSummary(Boolean worseOverride) {
-        if(((Run)this) instanceof AbstractBuild) {
-            AbstractTestResultAction trN = ((AbstractBuild)(Run)this).getTestResultAction();
-            Run prev = getPreviousBuild();
-            AbstractTestResultAction trP = prev==null ? null : ((AbstractBuild) prev).getTestResultAction();
-            if(trP==null) {
-                if(trN!=null && trN.getFailCount()>0)
-                    return new Summary(worseOverride != null ? worseOverride : true,
-                            Messages.Run_Summary_TestFailures(trN.getFailCount()));
-            } else {
-                if(trN!=null && trN.getFailCount()!= 0) {
-                    if(trP.getFailCount()==0)
-                        return new Summary(worseOverride != null ? worseOverride : true,
-                                Messages.Run_Summary_TestsStartedToFail(trN.getFailCount()));
-                    if(trP.getFailCount() < trN.getFailCount())
-                        return new Summary(worseOverride != null ? worseOverride : true,
-                                Messages.Run_Summary_MoreTestsFailing(trN.getFailCount()-trP.getFailCount(), trN.getFailCount()));
-                    if(trP.getFailCount() > trN.getFailCount())
-                        return new Summary(worseOverride != null ? worseOverride : false,
-                                Messages.Run_Summary_LessTestsFailing(trP.getFailCount()-trN.getFailCount(), trN.getFailCount()));
-                    
-                    return new Summary(worseOverride != null ? worseOverride : false,
-                            Messages.Run_Summary_TestsStillFailing(trN.getFailCount()));
-                }
-            }
-        }
-        
-        return new Summary(worseOverride != null ? worseOverride : false,
-                Messages.Run_Summary_Unstable());
-    }
-
-    /**
      * Serves the artifacts.
+     * @throws AccessDeniedException Access denied
      */
-    public DirectoryBrowserSupport doArtifact() {
+    public @Nonnull DirectoryBrowserSupport doArtifact() {
         if(Functions.isArtifactsPermissionEnabled()) {
           checkPermission(ARTIFACTS);
         }
-        return new DirectoryBrowserSupport(this, getArtifactManager().root(), project.getDisplayName() + ' ' + getDisplayName(), "package.png", true);
+        return new DirectoryBrowserSupport(this, getArtifactManager().root(), Messages.Run_ArtifactsBrowserTitle(project.getDisplayName(), getDisplayName()), "package.png", true);
     }
 
     /**
@@ -2071,19 +2088,13 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      */
     public void doConsoleText(StaplerRequest req, StaplerResponse rsp) throws IOException {
         rsp.setContentType("text/plain;charset=UTF-8");
-        // Prevent jelly from flushing stream so Content-Length header can be added afterwards
-        FlushProofOutputStream out = new FlushProofOutputStream(rsp.getCompressedOutputStream(req));
-        try{
-        	getLogText().writeLogTo(0,out);
-        } catch (IOException e) {
-			// see comment in writeLogTo() method
-			InputStream input = getLogInputStream();
-			try {
-				IOUtils.copy(input, out);
-			} finally {
-				IOUtils.closeQuietly(input);
-			}
-		} finally {
+        PlainTextConsoleOutputStream out = new PlainTextConsoleOutputStream(rsp.getCompressedOutputStream(req));
+        InputStream input = getLogInputStream();
+        try {
+            IOUtils.copy(input, out);
+            out.flush();
+        } finally {
+            IOUtils.closeQuietly(input);
             IOUtils.closeQuietly(out);
         }
     }
@@ -2093,6 +2104,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * @deprecated as of 1.352
      *      Use {@code getLogText().doProgressiveText(req,rsp)}
      */
+    @Deprecated
     public void doProgressiveLog( StaplerRequest req, StaplerResponse rsp) throws IOException {
         getLogText().doProgressText(req,rsp);
     }
@@ -2178,11 +2190,13 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     /**
      * @deprecated as of 1.292
-     *      Use {@link #getEnvironment()} instead.
+     *      Use {@link #getEnvironment(TaskListener)} instead.
      */
+    @Deprecated
     public Map<String,String> getEnvVars() {
+        LOGGER.log(WARNING, "deprecated call to Run.getEnvVars\n\tat {0}", new Throwable().getStackTrace()[1]);
         try {
-            return getEnvironment();
+            return getEnvironment(new LogTaskListener(LOGGER, Level.INFO));
         } catch (IOException e) {
             return new EnvVars();
         } catch (InterruptedException e) {
@@ -2193,7 +2207,9 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     /**
      * @deprecated as of 1.305 use {@link #getEnvironment(TaskListener)}
      */
+    @Deprecated
     public EnvVars getEnvironment() throws IOException, InterruptedException {
+        LOGGER.log(WARNING, "deprecated call to Run.getEnvironment\n\tat {0}", new Throwable().getStackTrace()[1]);
         return getEnvironment(new LogTaskListener(LOGGER, Level.INFO));
     }
 
@@ -2231,7 +2247,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * Builds up the environment variable map that's sufficient to identify a process
      * as ours. This is used to kill run-away processes via {@link ProcessTree#killAll(Map)}.
      */
-    public final EnvVars getCharacteristicEnvVars() {
+    public @Nonnull final EnvVars getCharacteristicEnvVars() {
         EnvVars env = getParent().getCharacteristicEnvVars();
         env.put("BUILD_NUMBER",String.valueOf(number));
         env.put("BUILD_ID",getId());
@@ -2239,21 +2255,37 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         return env;
     }
 
-    public String getExternalizableId() {
+    /**
+     * Produces an identifier for this run unique in the system.
+     * @return the {@link Job#getFullName}, then {@code #}, then {@link #getNumber}
+     * @see #fromExternalizableId
+     */
+    public @Nonnull String getExternalizableId() {
         return project.getFullName() + "#" + getNumber();
     }
 
-    public static Run<?,?> fromExternalizableId(String id) {
+    /**
+     * Tries to find a run from an persisted identifier.
+     * @param id as produced by {@link #getExternalizableId}
+     * @return the same run, or null if the job or run was not found
+     * @throws IllegalArgumentException if the ID is malformed
+     */
+    public @CheckForNull static Run<?,?> fromExternalizableId(String id) throws IllegalArgumentException {
         int hash = id.lastIndexOf('#');
         if (hash <= 0) {
             throw new IllegalArgumentException("Invalid id");
         }
         String jobName = id.substring(0, hash);
-        int number = Integer.parseInt(id.substring(hash + 1));
-
-        Job<?,?> job = Jenkins.getInstance().getItemByFullName(jobName, Job.class);
+        int number;
+        try {
+            number = Integer.parseInt(id.substring(hash + 1));
+        } catch (NumberFormatException x) {
+            throw new IllegalArgumentException(x);
+        }
+        Jenkins j = Jenkins.getInstance();
+        Job<?,?> job = j.getItemByFullName(jobName, Job.class);
         if (job == null) {
-            throw new IllegalArgumentException("no such job " + jobName);
+            return null;
         }
         return job.getBuildByNumber(number);
     }
@@ -2272,7 +2304,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
     }
 
     @RequirePOST
-    public HttpResponse doConfigSubmit( StaplerRequest req ) throws IOException, ServletException, FormException {
+    public @Nonnull HttpResponse doConfigSubmit( StaplerRequest req ) throws IOException, ServletException, FormException {
         checkPermission(UPDATE);
         BulkChange bc = new BulkChange(this);
         try {
@@ -2308,7 +2340,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * Sort by date. Newer ones first. 
      */
     public static final Comparator<Run> ORDER_BY_DATE = new Comparator<Run>() {
-        public int compare(Run lhs, Run rhs) {
+        public int compare(@Nonnull Run lhs, @Nonnull Run rhs) {
             long lt = lhs.getTimeInMillis();
             long rt = rhs.getTimeInMillis();
             if(lt>rt)   return -1;
@@ -2341,10 +2373,10 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
      * {@link BuildBadgeAction} that shows the logs are being kept.
      */
     public final class KeepLogBuildBadge implements BuildBadgeAction {
-        public String getIconFileName() { return null; }
-        public String getDisplayName() { return null; }
-        public String getUrlName() { return null; }
-        public String getWhyKeepLog() { return Run.this.getWhyKeepLog(); }
+        public @CheckForNull String getIconFileName() { return null; }
+        public @CheckForNull String getDisplayName() { return null; }
+        public @CheckForNull String getUrlName() { return null; }
+        public @CheckForNull String getWhyKeepLog() { return Run.this.getWhyKeepLog(); }
     }
 
     public static final PermissionGroup PERMISSIONS = new PermissionGroup(Run.class,Messages._Run_Permissions_Title());
@@ -2366,7 +2398,7 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
         public String getEntryID(Run entry) {
             return "tag:" + "hudson.dev.java.net,"
                 + entry.getTimestamp().get(Calendar.YEAR) + ":"
-                + entry.getParent().getName()+':'+entry.getId();
+                + entry.getParent().getFullName()+':'+entry.getId();
         }
 
         public String getEntryDescription(Run entry) {
@@ -2384,8 +2416,8 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
 
     @Override
     public Object getDynamic(String token, StaplerRequest req, StaplerResponse rsp) {
-        Object result = super.getDynamic(token, req, rsp);
-        if (result == null){
+        Object returnedResult = super.getDynamic(token, req, rsp);
+        if (returnedResult == null){
             //check transient actions too
             for(Action action: getTransientActions()){
                 String urlName = action.getUrlName();
@@ -2399,9 +2431,9 @@ public abstract class Run <JobT extends Job<JobT,RunT>,RunT extends Run<JobT,Run
             // Next/Previous Build links on an action page (like /job/Abc/123/testReport)
             // will also point to same action (/job/Abc/124/testReport), but other builds
             // may not have the action.. tell browsers to redirect up to the build page.
-            result = new RedirectUp();
+            returnedResult = new RedirectUp();
         }
-        return result;
+        return returnedResult;
     }
 
     public static class RedirectUp {

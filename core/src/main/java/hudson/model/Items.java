@@ -29,17 +29,28 @@ import hudson.Extension;
 import hudson.XmlFile;
 import hudson.model.listeners.ItemListener;
 import hudson.remoting.Callable;
+import hudson.security.ACL;
+import hudson.security.AccessControlled;
 import hudson.triggers.Trigger;
 import hudson.util.DescriptorList;
 import hudson.util.EditDistance;
 import hudson.util.XStream2;
 import jenkins.model.Jenkins;
+import org.acegisecurity.Authentication;
 import org.apache.commons.lang.StringUtils;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Stack;
+import java.util.StringTokenizer;
 import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
+
 import jenkins.model.DirectlyModifiableTopLevelItemGroup;
 import org.apache.commons.io.FileUtils;
 
@@ -55,6 +66,7 @@ public class Items {
      * @deprecated as of 1.286
      *      Use {@link #all()} for read access and {@link Extension} for registration.
      */
+    @Deprecated
     public static final List<TopLevelItemDescriptor> LIST = (List)new DescriptorList<TopLevelItem>(TopLevelItem.class);
 
     /**
@@ -104,6 +116,42 @@ public class Items {
         return Jenkins.getInstance().<TopLevelItem,TopLevelItemDescriptor>getDescriptorList(TopLevelItem.class);
     }
 
+    /**
+     * Returns all the registered {@link TopLevelItemDescriptor}s that the current security principal is allowed to
+     * create within the specified item group.
+     *
+     * @since TODO
+     */
+    public static List<TopLevelItemDescriptor> all(ItemGroup c) {
+        return all(Jenkins.getAuthentication(), c);
+    }
+
+    /**
+     * Returns all the registered {@link TopLevelItemDescriptor}s that the specified security principal is allowed to
+     * create within the specified item group.
+     *
+     * @since TODO
+     */
+    public static List<TopLevelItemDescriptor> all(Authentication a, ItemGroup c) {
+        List<TopLevelItemDescriptor> result = new ArrayList<TopLevelItemDescriptor>();
+        ACL acl;
+        if (c instanceof AccessControlled) {
+            acl = ((AccessControlled) c).getACL();
+        } else {
+            // fall back to root
+            acl = Jenkins.getInstance().getACL();
+        }
+        for (TopLevelItemDescriptor d: all()) {
+            if (acl.hasCreatePermission(a, c, d) && d.isApplicableIn(c)) {
+                result.add(d);
+            }
+        }
+        return result;
+    }
+
+    /**
+     * @deprecated Underspecified what the parameter is. {@link Descriptor#getId}? A {@link Describable} class name?
+     */
     public static TopLevelItemDescriptor getDescriptor(String fqcn) {
         return Descriptor.find(all(), fqcn);
     }
@@ -125,6 +173,7 @@ public class Items {
      * @deprecated as of 1.406
      *      Use {@link #fromNameList(ItemGroup, String, Class)}
      */
+    @Deprecated
     public static <T extends Item> List<T> fromNameList(String list, Class<T> type) {
         return fromNameList(null,list,type);
     }
@@ -132,16 +181,22 @@ public class Items {
     /**
      * Does the opposite of {@link #toNameList(Collection)}.
      */
-    public static <T extends Item> List<T> fromNameList(ItemGroup context, String list, Class<T> type) {
-        Jenkins hudson = Jenkins.getInstance();
-
+    public static <T extends Item> List<T> fromNameList(ItemGroup context, @Nonnull String list, @Nonnull Class<T> type) {
+        final Jenkins jenkins = Jenkins.getInstance();
+        
         List<T> r = new ArrayList<T>();
+        if (jenkins == null) {
+            return r;
+        }
+        
         StringTokenizer tokens = new StringTokenizer(list,",");
         while(tokens.hasMoreTokens()) {
             String fullName = tokens.nextToken().trim();
-            T item = hudson.getItem(fullName, context, type);
-            if(item!=null)
-                r.add(item);
+            if (StringUtils.isNotEmpty(fullName)) {
+                T item = jenkins.getItem(fullName, context, type);
+                if(item!=null)
+                    r.add(item);
+            }
         }
         return r;
     }
@@ -155,7 +210,7 @@ public class Items {
         String[] c = context.getFullName().split("/");
         String[] p = path.split("/");
 
-        Stack name = new Stack();
+        Stack<String> name = new Stack<String>();
         for (int i=0; i<c.length;i++) {
             if (i==0 && c[i].equals("")) continue;
             name.push(c[i]);
@@ -167,6 +222,11 @@ public class Items {
                 continue;
             }
             if (p[i].equals("..")) {
+                if (name.size() == 0) {
+                    throw new IllegalArgumentException(String.format(
+                            "Illegal relative path '%s' within context '%s'", path, context.getFullName()
+                    ));
+                }
                 name.pop();
                 continue;
             }
@@ -296,39 +356,33 @@ public class Items {
      */
     public static <T extends Item> List<T> getAllItems(final ItemGroup root, Class<T> type) {
         List<T> r = new ArrayList<T>();
-
-        Stack<ItemGroup> q = new Stack<ItemGroup>();
-        q.push(root);
-
-        while(!q.isEmpty()) {
-            ItemGroup<?> parent = q.pop();
-            for (Item i : parent.getItems()) {
-                if(type.isInstance(i)) {
-                    if (i.hasPermission(Item.READ))
-                        r.add(type.cast(i));
+        getAllItems(root, type, r);
+        return r;
+    }
+    private static <T extends Item> void getAllItems(final ItemGroup root, Class<T> type, List<T> r) {
+        List<Item> items = new ArrayList<Item>(((ItemGroup<?>) root).getItems());
+        Collections.sort(items, new Comparator<Item>() {
+            @Override public int compare(Item i1, Item i2) {
+                return name(i1).compareToIgnoreCase(name(i2));
+            }
+            String name(Item i) {
+                String n = i.getName();
+                if (i instanceof ItemGroup) {
+                    n += '/';
                 }
-                if(i instanceof ItemGroup)
-                    q.push((ItemGroup)i);
+                return n;
+            }
+        });
+        for (Item i : items) {
+            if (type.isInstance(i)) {
+                if (i.hasPermission(Item.READ)) {
+                    r.add(type.cast(i));
+                }
+            }
+            if (i instanceof ItemGroup) {
+                getAllItems((ItemGroup) i, type, r);
             }
         }
-        // sort by relative name, ignoring case
-        Collections.sort(r, new Comparator<T>() {
-            @Override
-            public int compare(T o1, T o2) {
-                if (o1 == null) {
-                    if (o2 == null) {
-                        return 0;
-                    }
-                    return 1;
-                }
-                if (o2 == null) {
-                    return -1;
-                }
-                return o1.getRelativeNameFrom(root).compareToIgnoreCase(o2.getRelativeNameFrom(root));
-            }
-            
-        });
-        return r;
     }
 
     /**
@@ -381,7 +435,7 @@ public class Items {
         FileUtils.moveDirectory(item.getRootDir(), destDir);
         oldParent.remove(item);
         I newItem = destination.add(item, name);
-        newItem.onLoad(destination, name);
+        item.movedTo(destination, newItem, destDir);
         ItemListener.fireLocationChange(newItem, oldFullName);
         return newItem;
     }

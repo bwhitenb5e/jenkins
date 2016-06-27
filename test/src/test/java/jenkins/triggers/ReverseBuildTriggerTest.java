@@ -36,8 +36,10 @@ import hudson.model.User;
 import hudson.security.AuthorizationMatrixProperty;
 import hudson.security.Permission;
 import hudson.security.ProjectMatrixAuthorizationStrategy;
+import hudson.tasks.BuildTrigger;
 import hudson.tasks.BuildTriggerTest;
 import hudson.triggers.Trigger;
+
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
@@ -47,15 +49,38 @@ import java.util.Set;
 import jenkins.model.Jenkins;
 import jenkins.security.QueueItemAuthenticatorConfiguration;
 import org.acegisecurity.Authentication;
+
+import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.core.IsNot.not;
 import static org.junit.Assert.*;
+
 import org.junit.Rule;
 import org.junit.Test;
+import org.jvnet.hudson.test.Issue;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.MockQueueItemAuthenticator;
 
 public class ReverseBuildTriggerTest {
 
     @Rule public JenkinsRule r = new JenkinsRule();
+
+    @Test public void configRoundtrip() throws Exception {
+        r.createFreeStyleProject("upstream");
+        FreeStyleProject downstream = r.createFreeStyleProject("downstream");
+        FreeStyleProject wayDownstream = r.createFreeStyleProject("wayDownstream");
+        downstream.addTrigger(new ReverseBuildTrigger("upstream", Result.SUCCESS));
+        downstream.getPublishersList().add(new BuildTrigger(Collections.singleton(wayDownstream), Result.SUCCESS));
+        downstream.save();
+        r.configRoundtrip(downstream);
+        ReverseBuildTrigger rbt = downstream.getTrigger(ReverseBuildTrigger.class);
+        assertNotNull(rbt);
+        assertEquals("upstream", rbt.getUpstreamProjects());
+        assertEquals(Result.SUCCESS, rbt.getThreshold());
+        BuildTrigger bt = downstream.getPublishersList().get(BuildTrigger.class);
+        assertNotNull(bt);
+        assertEquals(Collections.singletonList(wayDownstream), bt.getChildProjects(downstream));
+        assertEquals(Result.SUCCESS, bt.getThreshold());
+    }
 
     /** @see BuildTriggerTest#testDownstreamProjectSecurity */
     @Test public void upstreamProjectSecurity() throws Exception {
@@ -129,4 +154,30 @@ public class ReverseBuildTriggerTest {
         assertEquals(new Cause.UpstreamCause((Run) b), downstream.getLastBuild().getCause(Cause.UpstreamCause.class));
     }
 
+    @Issue("JENKINS-29876")
+    @Test
+    public void nullJobInTriggerNotCausesNPE() throws Exception {
+        final FreeStyleProject upstreamJob = r.createFreeStyleProject("upstream");
+
+        //job with trigger.job == null
+        final FreeStyleProject downstreamJob1 = r.createFreeStyleProject("downstream1");
+        final ReverseBuildTrigger reverseBuildTrigger = new ReverseBuildTrigger("upstream", Result.SUCCESS);
+        downstreamJob1.addTrigger(reverseBuildTrigger);
+        downstreamJob1.save();
+
+        //job with trigger.job != null
+        final FreeStyleProject downstreamJob2 = r.createFreeStyleProject("downstream2");
+        final ReverseBuildTrigger reverseBuildTrigger2 = new ReverseBuildTrigger("upstream", Result.SUCCESS);
+        downstreamJob2.addTrigger(reverseBuildTrigger2);
+        downstreamJob2.save();
+        r.configRoundtrip(downstreamJob2);
+
+        r.jenkins.rebuildDependencyGraph();
+        final FreeStyleBuild build = upstreamJob.scheduleBuild2(0).get();
+        r.waitUntilNoActivity();
+
+        r.assertLogNotContains("java.lang.NullPointerException", build);
+        assertThat("Build should be not triggered", downstreamJob1.getBuilds(), hasSize(0));
+        assertThat("Build should be triggered", downstreamJob2.getBuilds(), not(hasSize(0)));
+    }
 }

@@ -29,6 +29,7 @@ import hudson.Util;
 import hudson.diagnosis.OldDataMonitor;
 import hudson.model.Descriptor.FormException;
 import hudson.model.listeners.ItemListener;
+import hudson.security.ACL;
 import hudson.util.CaseInsensitiveComparator;
 import hudson.util.DescribableList;
 import hudson.util.FormValidation;
@@ -48,10 +49,12 @@ import javax.servlet.ServletException;
 import jenkins.model.Jenkins;
 
 import net.sf.json.JSONObject;
+import org.jenkinsci.Symbol;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.StaplerRequest;
@@ -106,6 +109,14 @@ public class ListView extends View implements DirectlyModifiableView {
     public ListView(String name, ViewGroup owner) {
         this(name);
         this.owner = owner;
+    }
+
+    /**
+     * Sets the columns of this view.
+     */
+    @DataBoundSetter
+    public void setColumns(List<ListViewColumn> columns) throws IOException {
+        this.columns.replaceBy(columns);
     }
 
     private Object readResolve() {
@@ -273,10 +284,10 @@ public class ListView extends View implements DirectlyModifiableView {
         return recurse;
     }
     
-    /*
-     * For testing purposes
+    /**
+     * @since 1.568
      */
-    void setRecurse(boolean recurse) {
+    public void setRecurse(boolean recurse) {
         this.recurse = recurse;
     }
 
@@ -397,7 +408,7 @@ public class ListView extends View implements DirectlyModifiableView {
             this.includePattern = Pattern.compile(includeRegex);
     }
 
-    @Extension
+    @Extension @Symbol("list")
     public static class DescriptorImpl extends ViewDescriptor {
         @Override
         public String getDisplayName() {
@@ -431,54 +442,87 @@ public class ListView extends View implements DirectlyModifiableView {
 
     @Restricted(NoExternalUse.class)
     @Extension public static final class Listener extends ItemListener {
-        @Override public void onLocationChanged(Item item, String oldFullName, String newFullName) {
-            for (Item g : Jenkins.getInstance().getAllItems()) {
+        @Override public void onLocationChanged(final Item item, final String oldFullName, final String newFullName) {
+            ACL.impersonate(ACL.SYSTEM, new Runnable() {
+                @Override public void run() {
+                    locationChanged(item, oldFullName, newFullName);
+                }
+            });
+        }
+        private void locationChanged(Item item, String oldFullName, String newFullName) {
+            final Jenkins jenkins = Jenkins.getInstance();
+            for (View view: jenkins.getViews()) {
+                if (view instanceof ListView) {
+                    renameViewItem(oldFullName, newFullName, jenkins, (ListView) view);
+                }
+            }
+            for (Item g : jenkins.getAllItems()) {
                 if (g instanceof ViewGroup) {
                     ViewGroup vg = (ViewGroup) g;
                     for (View v : vg.getViews()) {
                         if (v instanceof ListView) {
-                            ListView lv = (ListView) v;
-                            boolean needsSave;
-                            synchronized (lv) {
-                                Set<String> oldJobNames = new HashSet<String>(lv.jobNames);
-                                lv.jobNames.clear();
-                                for (String oldName : oldJobNames) {
-                                    lv.jobNames.add(Items.computeRelativeNamesAfterRenaming(oldFullName, newFullName, oldName, vg.getItemGroup()));
-                                }
-                                needsSave = !oldJobNames.equals(lv.jobNames);
-                            }
-                            if (needsSave) { // do not hold ListView lock at the time
-                                try {
-                                    g.save();
-                                } catch (IOException x) {
-                                    Logger.getLogger(ListView.class.getName()).log(Level.WARNING, null, x);
-                                }
-                            }
+                            renameViewItem(oldFullName, newFullName, vg, (ListView) v);
                         }
                     }
                 }
             }
         }
-        @Override public void onDeleted(Item item) {
-            for (Item g : Jenkins.getInstance().getAllItems()) {
+
+        private void renameViewItem(String oldFullName, String newFullName, ViewGroup vg, ListView lv) {
+            boolean needsSave;
+            synchronized (lv) {
+                Set<String> oldJobNames = new HashSet<String>(lv.jobNames);
+                lv.jobNames.clear();
+                for (String oldName : oldJobNames) {
+                    lv.jobNames.add(Items.computeRelativeNamesAfterRenaming(oldFullName, newFullName, oldName, vg.getItemGroup()));
+                }
+                needsSave = !oldJobNames.equals(lv.jobNames);
+            }
+            if (needsSave) { // do not hold ListView lock at the time
+                try {
+                    lv.save();
+                } catch (IOException x) {
+                    Logger.getLogger(ListView.class.getName()).log(Level.WARNING, null, x);
+                }
+            }
+        }
+
+        @Override public void onDeleted(final Item item) {
+            ACL.impersonate(ACL.SYSTEM, new Runnable() {
+                @Override public void run() {
+                    deleted(item);
+                }
+            });
+        }
+        private void deleted(Item item) {
+            final Jenkins jenkins = Jenkins.getInstance();
+            for (View view: jenkins.getViews()) {
+                if (view instanceof ListView) {
+                    deleteViewItem(item, jenkins, (ListView) view);
+                }
+            }
+            for (Item g : jenkins.getAllItems()) {
                 if (g instanceof ViewGroup) {
                     ViewGroup vg = (ViewGroup) g;
                     for (View v : vg.getViews()) {
                         if (v instanceof ListView) {
-                            ListView lv = (ListView) v;
-                            boolean needsSave;
-                            synchronized (lv) {
-                                needsSave = lv.jobNames.remove(item.getRelativeNameFrom(vg.getItemGroup()));
-                            }
-                            if (needsSave) {
-                                try {
-                                    g.save();
-                                } catch (IOException x) {
-                                    Logger.getLogger(ListView.class.getName()).log(Level.WARNING, null, x);
-                                }
-                            }
+                            deleteViewItem(item, vg, (ListView) v);
                         }
                     }
+                }
+            }
+        }
+
+        private void deleteViewItem(Item item, ViewGroup vg, ListView lv) {
+            boolean needsSave;
+            synchronized (lv) {
+                needsSave = lv.jobNames.remove(item.getRelativeNameFrom(vg.getItemGroup()));
+            }
+            if (needsSave) {
+                try {
+                    lv.save();
+                } catch (IOException x) {
+                    Logger.getLogger(ListView.class.getName()).log(Level.WARNING, null, x);
                 }
             }
         }

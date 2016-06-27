@@ -25,9 +25,11 @@
  */
 package hudson;
 
+import jenkins.util.SystemProperties;
 import hudson.cli.CLICommand;
 import hudson.console.ConsoleAnnotationDescriptor;
 import hudson.console.ConsoleAnnotatorFactory;
+import hudson.init.InitMilestone;
 import hudson.model.AbstractProject;
 import hudson.model.Action;
 import hudson.model.Describable;
@@ -73,7 +75,10 @@ import hudson.tasks.Publisher;
 import hudson.tasks.UserAvatarResolver;
 import hudson.util.Area;
 import hudson.util.FormValidation.CheckMethod;
+import hudson.util.HudsonIsLoading;
+import hudson.util.HudsonIsRestarting;
 import hudson.util.Iterators;
+import hudson.util.jna.GNUCLibrary;
 import hudson.util.Secret;
 import hudson.views.MyViewsTabBar;
 import hudson.views.ViewsTabBar;
@@ -126,7 +131,6 @@ import javax.servlet.http.HttpServletResponse;
 
 import jenkins.model.GlobalConfiguration;
 import jenkins.model.GlobalConfigurationCategory;
-import jenkins.model.GlobalConfigurationCategory.Unclassified;
 import jenkins.model.Jenkins;
 import jenkins.model.ModelObjectWithChildren;
 import jenkins.model.ModelObjectWithContextMenu;
@@ -139,6 +143,7 @@ import org.apache.commons.jelly.XMLOutput;
 import org.apache.commons.jexl.parser.ASTSizeFunction;
 import org.apache.commons.jexl.util.Introspector;
 import org.apache.commons.lang.StringUtils;
+import org.jenkins.ui.icon.IconSet;
 import org.jvnet.tiger_types.Types;
 import org.kohsuke.stapler.Ancestor;
 import org.kohsuke.stapler.Stapler;
@@ -150,6 +155,7 @@ import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
 import hudson.util.RunList;
 import java.util.concurrent.atomic.AtomicLong;
+import javax.annotation.CheckForNull;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
@@ -200,9 +206,36 @@ public class Functions {
     public static String rfc822Date(Calendar cal) {
         return Util.RFC822_DATETIME_FORMATTER.format(cal.getTime());
     }
-    
+
+    /**
+     * During Jenkins start-up, before {@link InitMilestone#PLUGINS_STARTED} the extensions lists will be empty
+     * and they are not guaranteed to be fully populated until after {@link InitMilestone#EXTENSIONS_AUGMENTED},
+     * similarly, during termination after {@link Jenkins#isTerminating()} is set, it is no longer safe to access
+     * the extensions lists.
+     * If you attempt to access the extensions list from a UI thread while the extensions are being loaded you will
+     * hit a big honking great monitor lock that will block until the effective extension list has been determined
+     * (as if a plugin fails to start, all of the failed plugin's extensions and any dependent plugins' extensions
+     * will have to be evicted from the list of extensions. In practical terms this only affects the
+     * "Jenkins is loading" screen, but as that screen uses the generic layouts we provide this utility method
+     * so that the generic layouts can avoid iterating extension lists while Jenkins is starting up.
+     * If you attempt to access the extensions list from a UI thread while Jenkins is being shut down, the extensions
+     * themselves may no longer be in a valid state and could attempt to revive themselves and block termination.
+     * In actual terms the termination only affects those views required to render {@link HudsonIsRestarting}'s
+     * {@code index.jelly} which is the same set as the {@link HudsonIsLoading} pages so it makes sense to
+     * use both checks here.
+     *
+     * @return {@code true} if the extensions lists have been populated.
+     * @since 1.607
+     */
+    public static boolean isExtensionsAvailable() {
+        final Jenkins jenkins = Jenkins.getInstanceOrNull();
+        return jenkins != null && jenkins.getInitLevel().compareTo(InitMilestone.EXTENSIONS_AUGMENTED) >= 0
+                && !jenkins.isTerminating();
+    }
+
     public static void initPageVariables(JellyContext context) {
-        String rootURL = Stapler.getCurrentRequest().getContextPath();
+        StaplerRequest currentRequest = Stapler.getCurrentRequest();
+        String rootURL = currentRequest.getContextPath();
 
         Functions h = new Functions();
         context.setVariable("h", h);
@@ -222,6 +255,9 @@ public class Functions {
          */
         context.setVariable("resURL",rootURL+getResourcePath());
         context.setVariable("imagesURL",rootURL+getResourcePath()+"/images");
+
+        context.setVariable("userAgent", currentRequest.getHeader("User-Agent"));
+        IconSet.initPageVariables(context);
     }
 
     /**
@@ -414,6 +450,7 @@ public class Functions {
      *      JEXL now supports the real ternary operator "x?y:z", so this work around
      *      is no longer necessary.
      */
+    @Deprecated
     public static Object ifThenElse(boolean cond, Object thenValue, Object elseValue) {
         return cond ? thenValue : elseValue;
     }
@@ -432,6 +469,15 @@ public class Functions {
 
     public static boolean isWindows() {
         return File.pathSeparatorChar==';';
+    }
+    
+    public static boolean isGlibcSupported() {
+        try {
+            GNUCLibrary.LIBC.getpid();
+            return true;
+        } catch(Throwable t) {
+            return false;
+        }
     }
 
     public static List<LogRecord> getLogRecords() {
@@ -525,7 +571,7 @@ public class Functions {
     /**
      * Set to true if you need to use the debug version of YUI.
      */
-    public static boolean DEBUG_YUI = Boolean.getBoolean("debug.YUI");
+    public static boolean DEBUG_YUI = SystemProperties.getBoolean("debug.YUI");
 
     /**
      * Creates a sub map by using the given range (both ends inclusive).
@@ -538,6 +584,20 @@ public class Functions {
             return map.tailMap(Integer.parseInt(to));
 
         return map.subMap(Integer.parseInt(to),Integer.parseInt(from)-1);
+    }
+
+    /**
+     * Creates a sub map by using the given range (upper end inclusive).
+     */
+    @Restricted(NoExternalUse.class)
+    public static <V> SortedMap<Integer,V> filterExcludingFrom(SortedMap<Integer,V> map, String from, String to) {
+        if(from==null && to==null)      return map;
+        if(to==null)
+            return map.headMap(Integer.parseInt(from));
+        if(from==null)
+            return map.tailMap(Integer.parseInt(to));
+
+        return map.subMap(Integer.parseInt(to),Integer.parseInt(from));
     }
 
     private static final SimpleFormatter formatter = new SimpleFormatter();
@@ -566,7 +626,7 @@ public class Functions {
             response.addCookie(c);
         }
         if (refresh) {
-            response.addHeader("Refresh", System.getProperty("hudson.Functions.autoRefreshSeconds", "10"));
+            response.addHeader("Refresh", SystemProperties.getString("hudson.Functions.autoRefreshSeconds", "10"));
         }
     }
 
@@ -788,7 +848,7 @@ public class Functions {
      */
     public static String getFooterURL() {
         if(footerURL == null) {
-            footerURL = System.getProperty("hudson.footerURL");
+            footerURL = SystemProperties.getString("hudson.footerURL");
             if(StringUtils.isBlank(footerURL)) {
                 footerURL = "http://jenkins-ci.org/";
             }
@@ -799,6 +859,10 @@ public class Functions {
 
     public static List<JobPropertyDescriptor> getJobPropertyDescriptors(Class<? extends Job> clazz) {
         return JobPropertyDescriptor.getPropertyDescriptors(clazz);
+    }
+
+    public static List<JobPropertyDescriptor> getJobPropertyDescriptors(Job job) {
+        return DescriptorVisibilityFilter.apply(job, JobPropertyDescriptor.getPropertyDescriptors(job.getClass()));
     }
 
     public static List<Descriptor<BuildWrapper>> getBuildWrapperDescriptors(AbstractProject<?,?> project) {
@@ -894,19 +958,15 @@ public class Functions {
      * @since 1.494
      */
     public static Collection<Descriptor> getSortedDescriptorsForGlobalConfig(Predicate<GlobalConfigurationCategory> predicate) {
-        ExtensionList<Descriptor> exts = Jenkins.getInstance().getExtensionList(Descriptor.class);
+        ExtensionList<Descriptor> exts = ExtensionList.lookup(Descriptor.class);
         List<Tag> r = new ArrayList<Tag>(exts.size());
 
         for (ExtensionComponent<Descriptor> c : exts.getComponents()) {
             Descriptor d = c.getInstance();
             if (d.getGlobalConfigPage()==null)  continue;
 
-            if (d instanceof GlobalConfiguration) {
-                if (predicate.apply(((GlobalConfiguration)d).getCategory()))
-                    r.add(new Tag(c.ordinal(), d));
-            } else {
-                if (predicate.apply(GlobalConfigurationCategory.get(Unclassified.class)))
-                    r.add(new Tag(0, d));
+            if (predicate.apply(d.getCategory())) {
+                r.add(new Tag(c.ordinal(), d));
             }
         }
         Collections.sort(r);
@@ -1345,7 +1405,7 @@ public class Functions {
     /**
      * If the value exists, return that value. Otherwise return the default value.
      * <p>
-     * Starting 1.294, JEXL supports the elvis operator "x?:y" that supercedes this.
+     * Starting 1.294, JEXL supports the elvis operator "x?:y" that supersedes this.
      *
      * @since 1.150
      */
@@ -1353,7 +1413,17 @@ public class Functions {
         return value!=null ? value : defaultValue;
     }
 
-    public static String printThrowable(Throwable t) {
+    /**
+     * Gets info about the specified {@link Throwable}.
+     * @param t Input {@link Throwable}
+     * @return If {@link Throwable} is not null, a summary info with the 
+     *      stacktrace will be returned. Otherwise, the method returns a default
+     *      &quot;No exception details&quot; string.
+     */
+    public static String printThrowable(@CheckForNull Throwable t) {
+        if (t == null) {
+            return Messages.Functions_NoExceptionDetails();
+        }
         StringWriter sw = new StringWriter();
         t.printStackTrace(new PrintWriter(sw));
         return sw.toString();
@@ -1463,10 +1533,12 @@ public class Functions {
     /**
      * Computes the hyperlink to actions, to handle the situation when the {@link Action#getUrlName()}
      * returns absolute URL.
+     *
+     * @return null in case the action should not be presented to the user.
      */
-    public static String getActionUrl(String itUrl,Action action) {
+    public static @CheckForNull String getActionUrl(String itUrl,Action action) {
         String urlName = action.getUrlName();
-        if(urlName==null)   return null;    // to avoid NPE and fail to render the whole page
+        if(urlName==null)   return null;    // Should not be displayed
         try {
             if (new URI(urlName).isAbsolute()) {
                 return urlName;
@@ -1503,15 +1575,11 @@ public class Functions {
         return projectName;
     }
 
-    public String getSystemProperty(String key) {
-        return System.getProperty(key);
-    }
-
     /**
      * Obtains the host name of the Hudson server that clients can use to talk back to.
      * <p>
      * This is primarily used in <tt>slave-agent.jnlp.jelly</tt> to specify the destination
-     * that the slaves talk to.
+     * that the agents talk to.
      */
     public String getServerName() {
         // Try to infer this from the configured root URL.
@@ -1535,6 +1603,7 @@ public class Functions {
      * @deprecated
      *      Use {@link #calcCheckUrl}
      */
+    @Deprecated
     public String getCheckUrl(String userDefined, Object descriptor, String field) {
         if(userDefined!=null || field==null)   return userDefined;
         if (descriptor instanceof Descriptor) {
@@ -1584,7 +1653,7 @@ public class Functions {
      */
     public static List<PageDecorator> getPageDecorators() {
         // this method may be called to render start up errors, at which point Hudson doesn't exist yet. see HUDSON-3608 
-        if(Jenkins.getInstance()==null)  return Collections.emptyList();
+        if(Jenkins.getInstanceOrNull()==null)  return Collections.emptyList();
         return PageDecorator.all();
     }
     
@@ -1606,13 +1675,13 @@ public class Functions {
     }
 
     public static String getCrumb(StaplerRequest req) {
-        Jenkins h = Jenkins.getInstance();
+        Jenkins h = Jenkins.getInstanceOrNull();
         CrumbIssuer issuer = h != null ? h.getCrumbIssuer() : null;
         return issuer != null ? issuer.getCrumb(req) : "";
     }
 
     public static String getCrumbRequestField() {
-        Jenkins h = Jenkins.getInstance();
+        Jenkins h = Jenkins.getInstanceOrNull();
         CrumbIssuer issuer = h != null ? h.getCrumbIssuer() : null;
         return issuer != null ? issuer.getDescriptor().getCrumbRequestField() : "";
     }
@@ -1677,7 +1746,16 @@ public class Functions {
      */
     public String getPasswordValue(Object o) {
         if (o==null)    return null;
-        if (o instanceof Secret)    return ((Secret)o).getEncryptedValue();
+        if (o instanceof Secret) {
+            StaplerRequest req = Stapler.getCurrentRequest();
+            if (req != null) {
+                Item item = req.findAncestorObject(Item.class);
+                if (item != null && !item.hasPermission(Item.CONFIGURE)) {
+                    return "********";
+                }
+            }
+            return ((Secret) o).getEncryptedValue();
+        }
         if (getIsUnitTest()) {
             throw new SecurityException("attempted to render plaintext ‘" + o + "’ in password field; use a getter of type Secret instead");
         }
@@ -1707,7 +1785,7 @@ public class Functions {
      * the permission can't be configured in the security screen). Got it?</p>
      */
     public static boolean isArtifactsPermissionEnabled() {
-        return Boolean.getBoolean("hudson.security.ArtifactsPermission");
+        return SystemProperties.getBoolean("hudson.security.ArtifactsPermission");
     }
 
     /**
@@ -1722,7 +1800,7 @@ public class Functions {
      * control on the "Wipe Out Workspace" action.</p>
      */
     public static boolean isWipeOutPermissionEnabled() {
-        return Boolean.getBoolean("hudson.security.WipeOutPermission");
+        return SystemProperties.getBoolean("hudson.security.WipeOutPermission");
     }
 
     public static String createRenderOnDemandProxy(JellyContext context, String attributesToCapture) {
@@ -1785,6 +1863,7 @@ public class Functions {
      * @deprecated as of 1.451
      *      Use {@link #getAvatar}
      */
+    @Deprecated
     public String getUserAvatar(User user, String avatarSize) {
         return getAvatar(user,avatarSize);
     }
@@ -1841,7 +1920,7 @@ public class Functions {
      * discovery of Jenkins.
      */
     public static void advertiseHeaders(HttpServletResponse rsp) {
-        Jenkins j = Jenkins.getInstance();
+        Jenkins j = Jenkins.getInstanceOrNull();
         if (j!=null) {
             rsp.setHeader("X-Hudson","1.395");
             rsp.setHeader("X-Jenkins", Jenkins.VERSION);
@@ -1849,9 +1928,10 @@ public class Functions {
 
             TcpSlaveAgentListener tal = j.tcpSlaveAgentListener;
             if (tal !=null) {
-                rsp.setIntHeader("X-Hudson-CLI-Port", tal.getPort());
-                rsp.setIntHeader("X-Jenkins-CLI-Port", tal.getPort());
-                rsp.setIntHeader("X-Jenkins-CLI2-Port", tal.getPort());
+                int p = tal.getAdvertisedPort();
+                rsp.setIntHeader("X-Hudson-CLI-Port", p);
+                rsp.setIntHeader("X-Jenkins-CLI-Port", p);
+                rsp.setIntHeader("X-Jenkins-CLI2-Port", p);
                 rsp.setHeader("X-Jenkins-CLI-Host", TcpSlaveAgentListener.CLI_HOST_NAME);
             }
         }

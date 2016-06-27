@@ -31,12 +31,12 @@ Usage
 =====
 
 Add the "sortable" CSS class to a table to make it sortable.
-The first column must be always table header, and the rest must be table data.
+The first row must be always table header, and the rest must be table data.
 (the script seems to support rows to be fixed at the bottom, but haven't figured out how to use it.)
 
 If the table data is sorted to begin with, you can add 'initialSortDir="up|down"' to the
-corresponding column in the header row to display the direction icon from the beginning.
-This is recommended to provide a visual cue that the table can be sorted.
+corresponding cell in the header row to display the direction icon from the beginning.
+This is recommended to provide a visual clue that the table can be sorted.
 
 The script guesses the table data, and try to use the right sorting algorithm.
 But you can override this behavior by having 'data="..."' attribute on each row,
@@ -295,6 +295,18 @@ var Sortable = (function() {
             return parseFloat(a) - parseFloat(b);
         },
 
+        percent : function(a,b) {
+            a = a.replace(/[^0-9.<>]/g,'');
+            b = b.replace(/[^0-9.<>]/g,'');
+            if (a == "<100") a = "99.9";
+            else if (a == ">0") a = "0.1";
+            if (b == "<100") b = "99.9";
+            else if (b == ">0") b = "0.1";
+            a = a.replace(/[^0-9.]/g,'');
+            b = b.replace(/[^0-9.]/g,'');
+            return parseFloat(a) - parseFloat(b);
+        },
+
         numeric : function(a,b) {
             a = parseFloat(a);
             if (isNaN(a)) a = 0;
@@ -323,6 +335,7 @@ var Sortable = (function() {
             if (itm.match(/^\d\d[\/-]\d\d[\/-]\d\d\d\d$/)) sortfn = this.date;
             if (itm.match(/^\d\d[\/-]\d\d[\/-]\d\d$/)) sortfn = this.date;
             if (itm.match(/^[�$]/)) sortfn = this.currency;
+            if (itm.match(/\%$/)) sortfn = this.percent;
             if (itm.match(/^-?[\d\.]+$/)) sortfn = this.numeric;
             return sortfn;
         },

@@ -4,7 +4,7 @@ import hudson.model.AbstractDescribableImpl
 import hudson.model.Describable
 import hudson.model.Descriptor
 import hudson.util.ListBoxModel
-import org.jvnet.hudson.test.Bug
+import org.jvnet.hudson.test.Issue
 import org.jvnet.hudson.test.HudsonTestCase
 import org.jvnet.hudson.test.TestExtension
 import org.kohsuke.stapler.QueryParameter
@@ -15,7 +15,7 @@ import org.kohsuke.stapler.QueryParameter
  * @author Kohsuke Kawaguchi
  */
 class RelativePathTest extends HudsonTestCase implements Describable<RelativePathTest> {
-    @Bug(18776)
+    @Issue("JENKINS-18776")
     void testRelativePath() {
         // I was having trouble causing annotation processing on test stubs
         jenkins.getDescriptorOrDie(RelativePathTest.class)
@@ -38,22 +38,12 @@ class RelativePathTest extends HudsonTestCase implements Describable<RelativePat
     }
 
     @TestExtension
-    static class DescriptorImpl extends Descriptor<RelativePathTest> {
-        @Override
-        String getDisplayName() {
-            return "";
-        }
-    }
+    static class DescriptorImpl extends Descriptor<RelativePathTest> {}
 
     static class Model extends AbstractDescribableImpl<Model> {
         @TestExtension
         static class DescriptorImpl extends Descriptor<Model> {
             boolean touched;
-
-            @Override
-            String getDisplayName() {
-                return "test";
-            }
 
             ListBoxModel doFillAbcItems(@RelativePath("..") @QueryParameter String name) {
                 assert name=="Alice";

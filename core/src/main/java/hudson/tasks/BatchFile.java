@@ -26,9 +26,12 @@ package hudson.tasks;
 import hudson.FilePath;
 import hudson.Extension;
 import hudson.model.AbstractProject;
+import hudson.util.LineEndingConversion;
 import net.sf.json.JSONObject;
+import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.StaplerRequest;
+import java.io.ObjectStreamException;
 
 /**
  * Executes commands by using Windows batch file.
@@ -38,7 +41,7 @@ import org.kohsuke.stapler.StaplerRequest;
 public class BatchFile extends CommandInterpreter {
     @DataBoundConstructor
     public BatchFile(String command) {
-        super(command);
+        super(LineEndingConversion.convertEOL(command, LineEndingConversion.EOLType.Windows));
     }
 
     public String[] buildCommandLine(FilePath script) {
@@ -46,14 +49,18 @@ public class BatchFile extends CommandInterpreter {
     }
 
     protected String getContents() {
-        return command+"\r\nexit %ERRORLEVEL%";
+        return LineEndingConversion.convertEOL(command+"\r\nexit %ERRORLEVEL%",LineEndingConversion.EOLType.Windows);
     }
 
     protected String getFileExtension() {
         return ".bat";
     }
 
-    @Extension
+    private Object readResolve() throws ObjectStreamException {
+        return new BatchFile(command);
+    }
+
+    @Extension @Symbol("batchFile")
     public static final class DescriptorImpl extends BuildStepDescriptor<Builder> {
         @Override
         public String getHelpFile() {

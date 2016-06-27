@@ -1,6 +1,7 @@
 package jenkins.security;
 
 import com.gargoylesoftware.htmlunit.ElementNotFoundException;
+import com.gargoylesoftware.htmlunit.html.DomNodeUtil;
 import com.gargoylesoftware.htmlunit.html.HtmlButton;
 import com.gargoylesoftware.htmlunit.html.HtmlForm;
 import com.gargoylesoftware.htmlunit.html.HtmlPage;
@@ -99,9 +100,9 @@ public class RekeySecretAdminMonitorTest extends HudsonTestCase {
         assertTrue(monitor.getLogFile().exists());
 
         // should be no warning/error now
-        HtmlPage manage = wc.goTo("/manage");
-        assertEquals(0,manage.selectNodes("//*[class='error']").size());
-        assertEquals(0,manage.selectNodes("//*[class='warning']").size());
+        HtmlPage manage = wc.goTo("manage");
+        assertEquals(0, DomNodeUtil.selectNodes(manage, "//*[class='error']").size());
+        assertEquals(0, DomNodeUtil.selectNodes(manage, "//*[class='warning']").size());
 
         // and the data should be rewritten
         verifyRewrite(jenkins.getRootDir());
@@ -121,7 +122,7 @@ public class RekeySecretAdminMonitorTest extends HudsonTestCase {
     }
 
     private HtmlForm getRekeyForm(WebClient wc) throws IOException, SAXException {
-        return wc.goTo("/manage").getFormByName("rekey");
+        return wc.goTo("manage").getFormByName("rekey");
     }
 
     private HtmlButton getButton(HtmlForm form, int index) {
@@ -140,8 +141,8 @@ public class RekeySecretAdminMonitorTest extends HudsonTestCase {
 
         // should be no warning/error now
         HtmlPage manage = wc.goTo("/manage");
-        assertEquals(0,manage.selectNodes("//*[class='error']").size());
-        assertEquals(0,manage.selectNodes("//*[class='warning']").size());
+        assertEquals(0, DomNodeUtil.selectNodes(manage, "//*[class='error']").size());
+        assertEquals(0, DomNodeUtil.selectNodes(manage, "//*[class='warning']").size());
     }
 
     private String encryptOld(String str) throws Exception {

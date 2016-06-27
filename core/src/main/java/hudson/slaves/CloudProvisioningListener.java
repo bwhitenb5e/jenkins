@@ -5,8 +5,6 @@ import hudson.ExtensionPoint;
 import hudson.model.Label;
 import hudson.model.Node;
 import hudson.model.queue.CauseOfBlockage;
-import jenkins.model.Jenkins;
-import org.jvnet.localizer.Localizable;
 
 import java.util.Collection;
 
@@ -76,7 +74,7 @@ public abstract class CloudProvisioningListener implements ExtensionPoint {
      * All the registered {@link CloudProvisioningListener}s.
      */
     public static ExtensionList<CloudProvisioningListener> all() {
-        return Jenkins.getInstance().getExtensionList(CloudProvisioningListener.class);
+        return ExtensionList.lookup(CloudProvisioningListener.class);
     }
 }
 

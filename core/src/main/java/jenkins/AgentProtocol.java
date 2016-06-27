@@ -4,8 +4,6 @@ import hudson.Extension;
 import hudson.ExtensionList;
 import hudson.ExtensionPoint;
 import hudson.TcpSlaveAgentListener;
-import hudson.model.AperiodicWork;
-import jenkins.model.Jenkins;
 
 import java.io.IOException;
 import java.net.Socket;
@@ -40,10 +38,10 @@ public abstract class AgentProtocol implements ExtensionPoint {
     public abstract void handle(Socket socket) throws IOException, InterruptedException;
 
     /**
-     * Returns all the registered {@link AperiodicWork}s.
+     * Returns all the registered {@link AgentProtocol}s.
      */
     public static ExtensionList<AgentProtocol> all() {
-        return Jenkins.getInstance().getExtensionList(AgentProtocol.class);
+        return ExtensionList.lookup(AgentProtocol.class);
     }
 
     public static AgentProtocol of(String protocolName) {

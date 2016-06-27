@@ -24,6 +24,7 @@
 
 package jenkins.security;
 
+import hudson.ExtensionList;
 import hudson.ExtensionPoint;
 import hudson.security.AbstractPasswordBasedSecurityRealm;
 import hudson.security.SecurityRealm;
@@ -32,11 +33,8 @@ import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nonnull;
-import jenkins.model.Jenkins;
 import org.acegisecurity.GrantedAuthority;
 import org.acegisecurity.userdetails.UserDetails;
-import org.kohsuke.accmod.Restricted;
-import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 /**
  * Listener notified of various significant events related to security.
@@ -81,13 +79,7 @@ public abstract class SecurityListener implements ExtensionPoint {
      */
     protected abstract void loggedOut(@Nonnull String username);
 
-    // TODO event for authenticated via SSH key in CLI (SshCliAuthenticator)
-    // TODO event for authenticated via API token (ApiTokenFilter)
-    // TODO event for permission denied exception thrown (mainly ACL.checkPermission), and/or caught at top level (ExceptionTranslationFilter.handleException)
-    // TODO event for new user signed up (e.g. in HudsonPrivateSecurityRealm)
-    // TODO event for CAPTCHA failure
-
-    @Restricted(NoExternalUse.class)
+    /** @since 1.569 */
     public static void fireAuthenticated(@Nonnull UserDetails details) {
         if (LOGGER.isLoggable(Level.FINE)) {
             List<String> groups = new ArrayList<String>();
@@ -103,7 +95,7 @@ public abstract class SecurityListener implements ExtensionPoint {
         }
     }
 
-    @Restricted(NoExternalUse.class)
+    /** @since 1.569 */
     public static void fireFailedToAuthenticate(@Nonnull String username) {
         LOGGER.log(Level.FINE, "failed to authenticate: {0}", username);
         for (SecurityListener l : all()) {
@@ -111,7 +103,7 @@ public abstract class SecurityListener implements ExtensionPoint {
         }
     }
 
-    @Restricted(NoExternalUse.class)
+    /** @since 1.569 */
     public static void fireLoggedIn(@Nonnull String username) {
         LOGGER.log(Level.FINE, "logged in: {0}", username);
         for (SecurityListener l : all()) {
@@ -119,7 +111,7 @@ public abstract class SecurityListener implements ExtensionPoint {
         }
     }
 
-    @Restricted(NoExternalUse.class)
+    /** @since 1.569 */
     public static void fireFailedToLogIn(@Nonnull String username) {
         LOGGER.log(Level.FINE, "failed to log in: {0}", username);
         for (SecurityListener l : all()) {
@@ -127,7 +119,7 @@ public abstract class SecurityListener implements ExtensionPoint {
         }
     }
 
-    @Restricted(NoExternalUse.class)
+    /** @since 1.569 */
     public static void fireLoggedOut(@Nonnull String username) {
         LOGGER.log(Level.FINE, "logged out: {0}", username);
         for (SecurityListener l : all()) {
@@ -136,7 +128,7 @@ public abstract class SecurityListener implements ExtensionPoint {
     }
 
     private static List<SecurityListener> all() {
-        return Jenkins.getInstance().getExtensionList(SecurityListener.class);
+        return ExtensionList.lookup(SecurityListener.class);
     }
 
 }
